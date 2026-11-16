@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# berth-netd: keeps this Proxmox host's NAT in step with berth's containers.
+#
+# Runs on the hypervisor as a systemd service (berth-netd.service). It owns:
+#
+#   - the containers' IPv4 gateway (V4_GATEWAY on BRIDGE) and IP forwarding
+#   - outbound NAT for V4_CIDR, so containers reach the internet over IPv4
+#   - one DNAT rule per port forward, so PUBLIC_V4:<port> reaches a container
+#
+# Where the forwards come from: berth writes them onto each container as
+# Proxmox tags, "berth-<tcp|udp>-<public port>-<container port>" (the SSH port
+# is one of them). This agent reads /etc/pve/lxc/*.conf every INTERVAL seconds
+# and rebuilds its own iptables chains to match, so nothing on the host has to
+# accept connections from berth or hold a berth secret.
+#
+# Trust: nothing reaches this agent over the network. berth writes tags through
+# the Proxmox API (TLS, pinned certificate, API token), and the agent reads
+# them from the local cluster filesystem. On top of Proxmox's own permissions:
+#   - each container's port tags carry an HMAC-SHA256 signature
+#     ("berth-sig-...") under NETD_KEY, a key only berth and this host hold,
+#     over the vmid and the tags; unsigned or mis-signed forwards are ignored,
+#     and signed tags copied onto another container do not verify
+#   - a tag only names two ports; the destination address comes from the
+#     container's own net0 and must be inside V4_CIDR
+#   - the public port must be in PORT_MIN..PORT_MAX, so nothing can claim the
+#     host's own SSH or web UI; containers outside VMID_MIN..VMID_MAX are ignored
+#
+# Everything lives in two chains, BERTH_PREROUTING and BERTH_POSTROUTING in the
+# nat table, replaced atomically on each change. Other rules are left alone.
+#
+#   berth-netd run       the service loop (what systemd runs)
+#   berth-netd --once    apply once and exit
+#   berth-netd --print   print the rules it would apply; changes nothing
+#   berth-netd --status  show the current chains and gateway
+#   berth-netd --check   validate /etc/berth-netd.conf
+#   berth-netd --fingerprint  this host's API certificate, to compare with
+#                        berth's PROXMOX_TLS_FINGERPRINT
+#   berth-netd --remove  remove its chains and gateway address
+set -uo pipefail
+
+CONF="${BERTH_NETD_CONF:-/etc/berth-netd.conf}"
+LXC_DIR="${BERTH_LXC_DIR:-/etc/pve/lxc}"
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+BRIDGE="${BRIDGE:-vmbr0}"
+V4_CIDR="${V4_CIDR:-10.60.0.0/22}"
+V4_GATEWAY="${V4_GATEWAY:-10.60.0.1}"
+PUBLIC_V4="${PUBLIC_V4:-}"
+PORT_MIN="${PORT_MIN:-20000}"
+PORT_MAX="${PORT_MAX:-29999}"
+VMID_MIN="${VMID_MIN:-3000}"
+VMID_MAX="${VMID_MAX:-3999}"
+IPV6_FORWARD="${IPV6_FORWARD:-1}"
+# Shared with berth (its BERTH_NETD_KEY). Forwards are applied only when their
+# signature checks out under this key.
+NETD_KEY="${NETD_KEY:-}"
+INTERVAL="${INTERVAL:-5}"
+# Reapply even when nothing changed, in case something flushed the nat table.
+RESYNC="${RESYNC:-60}"
+
+PRE=BERTH_PREROUTING
+POST=BERTH_POSTROUTING
+
+log() { printf 'berth-netd: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+valid_ip() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o
+  for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+}
+ip2int() {
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- $1
+  echo $(( (10#$1 << 24) + (10#$2 << 16) + (10#$3 << 8) + 10#$4 ))
+}
+in_cidr() {
+  local ip=$1 net=${2%/*} len=${2#*/} mask
+  mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  (( ($(ip2int "$ip") & mask) == ($(ip2int "$net") & mask) ))
+}
+is_int() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+check_config() {
+  local bad=0
+  [[ ${NETD_KEY,,} =~ ^[0-9a-f]{64}$ ]] \
+    || { log "NETD_KEY must be the 64-hex-digit BERTH_NETD_KEY from berth's server/.env"; bad=1; }
+  NETD_KEY=${NETD_KEY,,}
+  valid_ip "$PUBLIC_V4" || { log "PUBLIC_V4 must be the host's public IPv4 (got '${PUBLIC_V4}')"; bad=1; }
+  valid_ip "$V4_GATEWAY" || { log "V4_GATEWAY is not an IPv4 address: '$V4_GATEWAY'"; bad=1; }
+  local cidr_net="" cidr_len=99
+  # Copied out first: valid_ip runs its own match and overwrites BASH_REMATCH.
+  if [[ $V4_CIDR =~ ^([0-9.]+)/([0-9]{1,2})$ ]]; then cidr_net=${BASH_REMATCH[1]}; cidr_len=$((10#${BASH_REMATCH[2]})); fi
+  if [ -n "$cidr_net" ] && valid_ip "$cidr_net" && (( cidr_len <= 30 )); then
+    valid_ip "$V4_GATEWAY" && ! in_cidr "$V4_GATEWAY" "$V4_CIDR" && { log "V4_GATEWAY $V4_GATEWAY is outside V4_CIDR $V4_CIDR"; bad=1; }
+    valid_ip "$PUBLIC_V4" && in_cidr "$PUBLIC_V4" "$V4_CIDR" && { log "PUBLIC_V4 is inside V4_CIDR; that cannot be right"; bad=1; }
+  else
+    log "V4_CIDR must look like 10.60.0.0/22 (got '$V4_CIDR')"; bad=1
+  fi
+  local ints_ok=1
+  for v in PORT_MIN PORT_MAX VMID_MIN VMID_MAX INTERVAL RESYNC; do
+    is_int "${!v}" || { log "$v must be a whole number (got '${!v}')"; bad=1; ints_ok=0; }
+  done
+  if (( ints_ok )); then
+    (( PORT_MIN >= 1024 && PORT_MAX <= 65535 && PORT_MIN <= PORT_MAX )) \
+      || { log "PORT_MIN..PORT_MAX must lie within 1024..65535; keeping forwards off the host's own ports"; bad=1; }
+    (( VMID_MIN <= VMID_MAX )) || { log "VMID_MIN must not exceed VMID_MAX"; bad=1; }
+    (( INTERVAL >= 1 )) || { log "INTERVAL must be at least 1"; bad=1; }
+  fi
+  return $bad
+}
+
+# Prints "<ips> <tags>" for one container config: every ip= on a netN line of
+# the main section (snapshots follow in [name] sections and are ignored).
+read_conf() {
+  awk '
+    /^\[/ { exit }
+    /^net[0-9]+:/ {
+      line = $0; sub(/^net[0-9]+:[ \t]*/, "", line)
+      n = split(line, kv, ",")
+      for (i = 1; i <= n; i++) if (kv[i] ~ /^ip=/) {
+        v = substr(kv[i], 4); sub(/\/.*/, "", v)
+        if (v != "dhcp" && v != "manual") ips = ips (ips ? "," : "") v
+      }
+    }
+    /^tags:/ { t = $0; sub(/^tags:[ \t]*/, "", t); tags = t }
+    END { print (ips ? ips : "-"), (tags ? tags : "-") }
+  ' "$1"
+}
+
+# Reads "<vmid> <port tags joined by ;> <signature>" lines and prints the
+# vmids whose signature is right. One process for every container, with the
+# key passed through the environment rather than argv (argv is visible in ps).
+# The message format must match signatureTag() in berth's network.js.
+verify_signatures() {
+  NETD_KEY="$NETD_KEY" perl -MDigest::SHA=hmac_sha256_hex -ne '
+    BEGIN { $key = pack("H*", $ENV{NETD_KEY}); }
+    chomp; my ($vmid, $tags, $sig) = split / /;
+    next unless defined $sig && $sig ne "-";
+    my $want = substr(hmac_sha256_hex("berth-netd v1\n$vmid\n$tags", $key), 0, 32);
+    # Constant-time comparison.
+    my $diff = length($sig) ^ length($want);
+    $diff |= ord(substr($sig, $_, 1)) ^ ord(substr($want, $_, 1)) for 0 .. length($want) - 1;
+    print "$vmid\n" if $diff == 0;
+  '
+}
+
+# One line per accepted forward: "<proto> <public port> <ip> <port> <vmid>".
+collect() {
+  local f vmid ips tags ip cand tag proto pub dst sig joined
+  declare -A seen=() ct_ip=() ct_tags=() ok=()
+  local -a order=() lines=()
+  shopt -s nullglob
+
+  # Pass 1: what each container in range asks for, and its signature.
+  for f in "$LXC_DIR"/*.conf; do
+    vmid=${f##*/}; vmid=${vmid%.conf}
+    is_int "$vmid" || continue
+    (( vmid >= VMID_MIN && vmid <= VMID_MAX )) || continue
+    read -r ips tags < <(read_conf "$f")
+    [ "$tags" = "-" ] && continue
+
+    local -a port_tags=()
+    sig="-"
+    IFS=';, ' read -ra tag_list <<< "$tags"
+    for tag in "${tag_list[@]}"; do
+      if [[ $tag =~ ^berth-(tcp|udp)-[0-9]{1,5}-[0-9]{1,5}$ ]]; then port_tags+=("$tag")
+      elif [[ $tag =~ ^berth-sig-([0-9a-f]{32})$ ]]; then sig=${BASH_REMATCH[1]}
+      fi
+    done
+    (( ${#port_tags[@]} )) || continue
+    joined=$(printf '%s\n' "${port_tags[@]}" | LC_ALL=C sort -u | paste -sd';' -)
+
+    ip=""
+    IFS=, read -ra cands <<< "$ips"
+    for cand in "${cands[@]}"; do
+      if [ "$cand" != "-" ] && valid_ip "$cand" && in_cidr "$cand" "$V4_CIDR"; then ip=$cand; break; fi
+    done
+
+    order+=("$vmid"); ct_ip[$vmid]=$ip; ct_tags[$vmid]=$joined
+    lines+=("$vmid $joined $sig")
+  done
+  (( ${#order[@]} )) || return 0
+
+  # Only forwards berth signed are applied.
+  while read -r vmid; do [ -n "$vmid" ] && ok[$vmid]=1; done \
+    < <(printf '%s\n' "${lines[@]}" | verify_signatures)
+
+  # Pass 2: validate and emit.
+  for vmid in "${order[@]}"; do
+    if [ -z "${ok[$vmid]:-}" ]; then
+      log "CT $vmid: forwards are unsigned or the signature is wrong (is NETD_KEY the same as berth's BERTH_NETD_KEY?); skipped"
+      continue
+    fi
+    ip=${ct_ip[$vmid]}
+    if [ -z "$ip" ]; then
+      log "CT $vmid: has forwards but no address in $V4_CIDR; skipped"; continue
+    fi
+    IFS=';' read -ra tag_list <<< "${ct_tags[$vmid]}"
+    for tag in "${tag_list[@]}"; do
+      [[ $tag =~ ^berth-(tcp|udp)-([0-9]{1,5})-([0-9]{1,5})$ ]] || continue
+      proto=${BASH_REMATCH[1]}; pub=$((10#${BASH_REMATCH[2]})); dst=$((10#${BASH_REMATCH[3]}))
+      if (( pub < PORT_MIN || pub > PORT_MAX )); then
+        log "CT $vmid: $tag: public port $pub is outside $PORT_MIN-$PORT_MAX; skipped"; continue
+      fi
+      if (( dst < 1 || dst > 65535 )); then
+        log "CT $vmid: $tag: container port $dst is invalid; skipped"; continue
+      fi
+      if [ -n "${seen[$proto:$pub]:-}" ]; then
+        log "CT $vmid: $tag: $proto port $pub already goes to CT ${seen[$proto:$pub]}; skipped"; continue
+      fi
+      seen[$proto:$pub]=$vmid
+      echo "$proto $pub $ip $dst $vmid"
+    done
+  done
+}
+
+# The iptables-restore input. Declaring the two chains flushes and refills
+# exactly them, atomically; --noflush leaves every other rule alone.
+render() {
+  local proto pub ip dst vmid
+  echo "*nat"
+  echo ":$PRE - [0:0]"
+  echo ":$POST - [0:0]"
+  # Containers out to the internet.
+  echo "-A $POST -s $V4_CIDR ! -d $V4_CIDR -j MASQUERADE"
+  # A container reaching another container through the public address:
+  # without this the reply skips the host and the connection hangs.
+  echo "-A $POST -s $V4_CIDR -d $V4_CIDR -m conntrack --ctstate DNAT -j MASQUERADE"
+  while read -r proto pub ip dst vmid; do
+    [ -n "${proto:-}" ] || continue
+    echo "-A $PRE -d $PUBLIC_V4/32 -p $proto -m $proto --dport $pub -m comment --comment \"berth CT $vmid\" -j DNAT --to-destination $ip:$dst"
+  done < <(collect)
+  echo "COMMIT"
+}
+
+ensure_base() {
+  sysctl -qw net.ipv4.ip_forward=1 >/dev/null
+  if [ "$IPV6_FORWARD" = 1 ]; then sysctl -qw net.ipv6.conf.all.forwarding=1 >/dev/null; fi
+  local len=${V4_CIDR#*/}
+  if ! ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | grep -qw "$V4_GATEWAY/$len"; then
+    if ip addr add "$V4_GATEWAY/$len" dev "$BRIDGE"; then
+      log "added gateway $V4_GATEWAY/$len on $BRIDGE"
+    else
+      log "could not add $V4_GATEWAY/$len on $BRIDGE"
+    fi
+  fi
+}
+
+ensure_jumps() {
+  iptables -w -t nat -C PREROUTING -j "$PRE" 2>/dev/null || iptables -w -t nat -I PREROUTING 1 -j "$PRE"
+  iptables -w -t nat -C POSTROUTING -j "$POST" 2>/dev/null || iptables -w -t nat -I POSTROUTING 1 -j "$POST"
+}
+
+apply() {
+  local payload=$1
+  printf '%s\n' "$payload" | iptables-restore -w --noflush || return 1
+  ensure_jumps
+}
+
+count_forwards() { grep -c -- "-j DNAT" <<< "$1" || true; }
+
+remove() {
+  iptables -w -t nat -D PREROUTING -j "$PRE" 2>/dev/null
+  iptables -w -t nat -D POSTROUTING -j "$POST" 2>/dev/null
+  for c in "$PRE" "$POST"; do
+    iptables -w -t nat -F "$c" 2>/dev/null
+    iptables -w -t nat -X "$c" 2>/dev/null
+  done
+  ip addr del "$V4_GATEWAY/${V4_CIDR#*/}" dev "$BRIDGE" 2>/dev/null
+  log "removed $PRE, $POST and $V4_GATEWAY on $BRIDGE (IP forwarding left on)"
+}
+
+# The SHA-256 fingerprint of the certificate the Proxmox API serves, read from
+# disk here on the host, so it can be compared with the PROXMOX_TLS_FINGERPRINT
+# berth pinned over the network. If they differ, something is in between.
+fingerprint() {
+  local f=/etc/pve/local/pveproxy-ssl.pem
+  [ -r "$f" ] || f=/etc/pve/local/pve-ssl.pem
+  [ -r "$f" ] || die "no Proxmox certificate found under /etc/pve/local"
+  openssl x509 -noout -fingerprint -sha256 -in "$f" | sed 's/^.*=//'
+}
+
+status() {
+  echo "gateway:"; ip -4 -o addr show dev "$BRIDGE" | grep -w "$V4_GATEWAY" || echo "  (missing)"
+  echo "ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)  ipv6 forwarding: $(cat /proc/sys/net/ipv6/conf/all/forwarding)"
+  echo; iptables -w -t nat -S "$POST" 2>/dev/null || echo "$POST: missing"
+  echo; iptables -w -t nat -S "$PRE" 2>/dev/null || echo "$PRE: missing"
+}
+
+run() {
+  local last="" last_at=0 payload now n warn last_warn="" warnfile
+  warnfile=$(mktemp)
+  log "watching $LXC_DIR (CT $VMID_MIN-$VMID_MAX, ports $PORT_MIN-$PORT_MAX, $V4_CIDR via $V4_GATEWAY on $BRIDGE, public $PUBLIC_V4)"
+  trap 'rm -f "$warnfile"; log "stopping; rules stay in place"; exit 0' TERM INT
+  while true; do
+    ensure_base
+    payload=$(render 2>"$warnfile")
+    # Skipped-forward warnings repeat every pass; log them only when they change.
+    warn=$(cat "$warnfile")
+    if [ "$warn" != "$last_warn" ]; then
+      [ -n "$warn" ] && printf '%s\n' "$warn" >&2
+      last_warn=$warn
+    fi
+    now=$(date +%s)
+    if [ "$payload" != "$last" ] || (( now - last_at >= RESYNC )); then
+      if apply "$payload"; then
+        if [ "$payload" != "$last" ]; then
+          n=$(count_forwards "$payload")
+          log "applied $n forward(s)"
+        fi
+        last=$payload; last_at=$now
+      else
+        log "iptables-restore failed; will retry"
+      fi
+    fi
+    sleep "$INTERVAL" & wait $!
+  done
+}
+
+case "${1:-run}" in
+  run)       check_config || exit 1; run ;;
+  --once)    check_config || exit 1; ensure_base; p=$(render); apply "$p" && log "applied $(count_forwards "$p") forward(s)" ;;
+  --print)   check_config || exit 1; render ;;
+  --check)   check_config && echo "config ok: $CONF" ;;
+  --fingerprint) fingerprint ;;
+  --status)  status ;;
+  --remove)  remove ;;
+  -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)         die "unknown command '$1' (try --help)" ;;
+esac

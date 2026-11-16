@@ -1,0 +1,36 @@
+# /etc/berth-netd.conf: settings for the berth NAT agent on the Proxmox host.
+# These must match berth's server/.env (names in brackets).
+# After editing: systemctl restart berth-netd
+
+# The bridge containers attach to [PROXMOX_BRIDGE].
+BRIDGE=vmbr0
+
+# The host's public IPv4; forwards listen here [BERTH_PUBLIC_V4].
+PUBLIC_V4=
+
+# The containers' private network and the gateway the host holds on BRIDGE
+# [BERTH_V4_CIDR, BERTH_V4_GATEWAY].
+V4_CIDR=10.60.0.0/22
+V4_GATEWAY=10.60.0.1
+
+# Public ports berth hands out [BERTH_NAT_PORT_MIN, BERTH_NAT_PORT_MAX].
+# Tags asking for any other port are ignored, so nothing can claim 22 or 8006.
+PORT_MIN=20000
+PORT_MAX=29999
+
+# Containers berth manages [PROXMOX_VMID_MIN, PROXMOX_VMID_MAX]. Others are
+# never touched.
+VMID_MIN=3000
+VMID_MAX=3999
+
+# Route the containers' public IPv6 through the host (they use the host's
+# address as their IPv6 gateway). 0 if your provider's /64 is on-link instead.
+IPV6_FORWARD=1
+
+# The key berth signs forwards with: the same value as BERTH_NETD_KEY in
+# berth's server/.env. Forwards without a valid signature are ignored. This
+# file holds a secret, so keep it root-only (chmod 600).
+NETD_KEY=
+
+# Seconds between checks for new or removed forwards.
+INTERVAL=5

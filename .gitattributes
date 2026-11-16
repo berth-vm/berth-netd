@@ -1,0 +1,2 @@
+# These run on Linux. A CRLF checkout (git on Windows) breaks bash and systemd.
+* text=auto eol=lf

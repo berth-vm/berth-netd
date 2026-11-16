@@ -1,0 +1,17 @@
+[Unit]
+Description=berth NAT agent (container port forwards and outbound NAT)
+Documentation=file:///usr/local/sbin/berth-netd
+# /etc/pve is the cluster filesystem; the container configs live there.
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+Requires=pve-cluster.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/berth-netd --check
+ExecStart=/usr/local/sbin/berth-netd run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
