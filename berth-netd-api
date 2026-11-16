@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""berth-netd-api: berth-netd's status and SSH diagnostics over HTTPS, as JSON.
+
+Started by `berth-netd run` when API_PORT is set (or by `berth-netd --api`),
+never by hand: it takes everything from the environment berth-netd gives it.
+
+  NETD_KEY      the 64-hex-digit key berth and this host share
+  API_BIND      the address to listen on (the host's public IPv4)
+  API_PORT      the port
+  API_TLS       1: HTTPS with API_TLS_CERT/API_TLS_KEY (the host's Proxmox
+                API certificate, so berth pins the fingerprint it already
+                pins); 0: plain HTTP, for tests only
+  BERTH_NETD    the berth-netd script, which does the measuring
+
+Authentication: every request carries
+
+  Authorization: berth-netd-v1 <unix time>:<hex HMAC-SHA256>
+
+where the HMAC is over "berth-netd api v1\\n<unix time>\\n<METHOD>\\n<path>"
+under the raw 32-byte key (the hex decoded), and <unix time> must be within
+60 seconds of this host's clock. Anything else gets 401 and nothing else.
+
+Endpoints (all GET):
+
+  /v1/health                            {"ok": true, "version": "1"}
+  /v1/status                            gateway, forwarding, chains, forwards
+  /v1/containers/<vmid>/ssh-diagnosis   everything `berth-netd --diagnose-ssh`
+                                        measures (it takes a few seconds, and
+                                        one runs at a time)
+
+Only Python's standard library is used, so nothing needs installing.
+"""
+import hashlib
+import hmac
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "1"
+WINDOW = 60                      # seconds a request's timestamp may be off
+DIAG_TIMEOUT = 120               # the diagnosis bounds itself well under this
+DIAG_WAIT = 30                   # seconds to wait for a running diagnosis
+
+AGENT = os.environ.get("BERTH_NETD", "/usr/local/sbin/berth-netd")
+KEY = bytes.fromhex(os.environ["NETD_KEY"])
+diag_lock = threading.Lock()
+
+
+def log(msg):
+    print(f"berth-netd-api: {msg}", file=sys.stderr, flush=True)
+
+
+def signature(ts, method, path):
+    msg = f"berth-netd api v1\n{ts}\n{method}\n{path}".encode()
+    return hmac.new(KEY, msg, hashlib.sha256).hexdigest()
+
+
+def typed(value):
+    """Numbers and booleans as such; everything else stays a string."""
+    if value in ("true", "false"):
+        return value == "true"
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        return float(value)
+    return value
+
+
+def records(text):
+    """berth-netd's "<key>\\t<value>" lines as nested JSON: dotted keys nest,
+    "hint" and "uplink" repeat and become lists."""
+    out = {"hints": [], "uplinks": []}
+    for line in text.splitlines():
+        if "\t" not in line:
+            continue
+        key, value = line.split("\t", 1)
+        if key == "hint":
+            out["hints"].append(value)
+        elif key == "uplink":
+            port, qdisc, dropped = (value.split(" ") + ["?", "0"])[:3]
+            out["uplinks"].append({"port": port, "qdisc": qdisc.split(","), "tx_dropped": typed(dropped)})
+        else:
+            node = out
+            parts = key.split(".")
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = typed(value)
+    return out
+
+
+def agent(*args, timeout=30):
+    """Runs berth-netd and returns (exit code, stdout, stderr)."""
+    try:
+        p = subprocess.run(["bash", AGENT, *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"berth-netd {' '.join(args)} did not finish within {timeout}s"
+    return p.returncode, p.stdout, p.stderr.strip()
+
+
+def status():
+    rc, out, err = agent("--status", "--raw")
+    if rc != 0:
+        return 500, {"error": err or "berth-netd --status failed"}
+    data = records(out)
+    data.pop("hints", None)
+    data.pop("uplinks", None)
+    forwards = []
+    for line in out.splitlines():
+        if line.startswith("forward\t"):
+            proto, pub, ip, port, vmid = line.split("\t", 1)[1].split(" ")
+            forwards.append({"proto": proto, "public_port": int(pub), "ip": ip, "port": int(port), "vmid": int(vmid)})
+    data["forwards"] = forwards
+    return 200, data
+
+
+def diagnosis(vmid):
+    if not diag_lock.acquire(timeout=DIAG_WAIT):
+        return 429, {"error": "a diagnosis is already running; try again in a moment"}
+    try:
+        rc, out, err = agent("--diagnose-ssh", str(vmid), "--raw", timeout=DIAG_TIMEOUT)
+    finally:
+        diag_lock.release()
+    if rc == 2:
+        return 404, {"error": err or f"CT {vmid}: no such container"}
+    if rc == 124:
+        return 504, {"error": err}
+    if rc != 0:
+        return 500, {"error": err or f"berth-netd --diagnose-ssh exited {rc}"}
+    data = records(out)
+    data["measured_at"] = int(time.time())
+    return 200, data
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "berth-netd-api/" + VERSION
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # one journal line per request
+        log(f"{self.client_address[0]} {fmt % args}")
+
+    def reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def authorized(self, path):
+        m = re.fullmatch(r"berth-netd-v1 (\d{1,20}):([0-9a-f]{64})", self.headers.get("Authorization", ""))
+        if not m:
+            return False
+        ts = int(m.group(1))
+        if abs(time.time() - ts) > WINDOW:
+            return False
+        return hmac.compare_digest(m.group(2), signature(ts, self.command, path))
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if not self.authorized(path):
+            return self.reply(401, {"error": "missing, wrong or stale signature"})
+        if path == "/v1/health":
+            return self.reply(200, {"ok": True, "version": VERSION})
+        if path == "/v1/status":
+            return self.reply(*status())
+        m = re.fullmatch(r"/v1/containers/(\d{1,9})/ssh-diagnosis", path)
+        if m:
+            return self.reply(*diagnosis(int(m.group(1))))
+        self.reply(404, {"error": "no such endpoint"})
+
+    do_HEAD = do_GET
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):  # a failed handshake is one line, not a traceback
+        log(f"{client_address[0]}: {sys.exc_info()[1]}")
+
+
+def main():
+    bind = os.environ.get("API_BIND") or "0.0.0.0"
+    port = int(os.environ["API_PORT"])
+    httpd = Server((bind, port), Handler)
+    scheme = "http"
+    if os.environ.get("API_TLS", "1") != "0":
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(os.environ["API_TLS_CERT"], os.environ["API_TLS_KEY"])
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+        with open(os.environ["API_TLS_CERT"], "rb") as f:
+            der = ssl.PEM_cert_to_DER_cert(f.read().decode())
+        fp = ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest())
+        log(f"certificate {fp}")
+    log(f"listening on {scheme}://{bind}:{port}/v1/")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

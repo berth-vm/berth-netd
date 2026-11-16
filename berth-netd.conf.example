@@ -39,3 +39,11 @@ SSH_PASSWORD_LOGIN=1
 
 # Seconds between checks for new or removed forwards.
 INTERVAL=5
+
+# The API (README, "API"): berth-netd's status and SSH diagnostics as JSON over
+# HTTPS, for berth to query. Off while API_PORT is empty. It serves this host's
+# own Proxmox API certificate (so berth pins the fingerprint it already pins)
+# and answers only requests signed with NETD_KEY. Pick a port outside
+# PORT_MIN-PORT_MAX, e.g. 8077. API_BIND defaults to PUBLIC_V4.
+API_PORT=
+API_BIND=

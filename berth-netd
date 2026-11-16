@@ -33,12 +33,15 @@
 #   berth-netd run       the service loop (what systemd runs)
 #   berth-netd --once    apply once and exit
 #   berth-netd --print   print the rules it would apply; changes nothing
-#   berth-netd --status  show the current chains and gateway
+#   berth-netd --status  show the current chains and gateway (--raw: records)
 #   berth-netd --check   validate /etc/berth-netd.conf
 #   berth-netd --configure-ssh  allow root password SSH in new containers now
 #                        (the service does this by itself within seconds)
 #   berth-netd --diagnose-ssh <vmid>  time each hop of an SSH login to one
 #                        container, to see where a slow login spends its time
+#                        (--raw: as key/value records, what the API serves)
+#   berth-netd --api     serve --status and --diagnose-ssh as JSON over HTTPS
+#                        (the service does this by itself when API_PORT is set)
 #   berth-netd --fingerprint  this host's API certificate, to compare with
 #                        berth's PROXMOX_TLS_FINGERPRINT
 #   berth-netd --remove  remove its chains and gateway address
@@ -114,6 +117,14 @@ check_config() {
       || { log "PORT_MIN..PORT_MAX must lie within 1024..65535; keeping forwards off the host's own ports"; bad=1; }
     (( VMID_MIN <= VMID_MAX )) || { log "VMID_MIN must not exceed VMID_MAX"; bad=1; }
     (( INTERVAL >= 1 )) || { log "INTERVAL must be at least 1"; bad=1; }
+  fi
+  if [ -n "${API_PORT:-}" ] && [ "${API_PORT}" != 0 ]; then
+    if ! is_int "$API_PORT" || (( API_PORT < 1 || API_PORT > 65535 )); then
+      log "API_PORT must be a port number, or empty to keep the API off (got '$API_PORT')"; bad=1
+    elif (( API_PORT == 22 || API_PORT == 8006 )) || { (( ints_ok )) && (( API_PORT >= PORT_MIN && API_PORT <= PORT_MAX )); }; then
+      log "API_PORT $API_PORT is the host's SSH or web UI port, or inside the forward range $PORT_MIN-$PORT_MAX"; bad=1
+    fi
+    [ -z "${API_BIND:-}" ] || valid_ip "$API_BIND" || { log "API_BIND is not an IPv4 address: '$API_BIND'"; bad=1; }
   fi
   return $bad
 }
@@ -441,113 +452,265 @@ SCRIPT
 
 ms_now() { echo $(( ${EPOCHREALTIME/./} / 1000 )); }
 
-# Every character typed is a round trip: client -> host -> container -> back.
-# The NAT adds nothing measurable. What does is the container waiting for a
-# CPU (cores/cpulimit, or a busy host), memory pressure in it, the uplink's
-# queue filling behind someone's upload, or simply the distance to the
-# client. The first three can be seen from here, through the cgroup files
-# that Proxmox keeps per container, without entering it.
-typing_latency() {
-  local vmid=$1 ip=$2 rtt v up port kinds cg
+# One measurement: "<key><TAB><value>". `--diagnose-ssh <vmid> --raw` prints
+# these, the API serves them as JSON, and the report below is rendered from
+# them, so all three say the same thing. "hint" and "uplink" repeat.
+rec() { printf '%s\t%s\n' "$1" "$(printf '%s' "$2" | tr '\t\n' '  ')"; }
+hint() { rec hint "$1"; }
+psi10() { awk '/^some/ { sub(/avg10=/, "", $2); print $2 }' "$1"; }
+psi60() { awk '/^some/ { sub(/avg60=/, "", $3); print $3 }' "$1"; }
+above() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
+
+# Measures everything about one container. Returns 0 even when it has no
+# signed forwards or is stopped (the records say so), 2 when it doesn't exist.
+diagnose_collect() {
+  local vmid=$1 ip="" fwd="" pub="" proto p v dst owner t ms out what detail rtt lim cg up port kinds l1 l5 l15 pressure n ns
+  [ -f "$LXC_DIR/$vmid.conf" ] || { log "CT $vmid: no config in $LXC_DIR"; return 2; }
+  rec container.vmid "$vmid"
+  while read -r proto p v dst owner; do
+    [ "$owner" = "$vmid" ] || continue
+    ip=$v; [ "$proto:$dst" = tcp:22 ] && { fwd="$PUBLIC_V4:$p"; pub=$p; }
+  done < <(collect 2>/dev/null)
+  if [ -z "$ip" ]; then
+    rec container.signed false
+    hint "CT $vmid has no signed forwards (see 'berth-netd --print'), so its SSH port is not reachable through this host"
+    return 0
+  fi
+  rec container.signed true
+  rec container.ip "$ip"
+  if [ -n "$fwd" ]; then rec forward.public "$fwd"; rec forward.port "$pub"
+  else hint "no signed tcp forward to port 22: SSH is not reachable from outside"; fi
+  if ! ct_running "$vmid"; then rec container.running false; hint "CT $vmid is not running"; return 0; fi
+  rec container.running true
+
+  # The host.
+  read -r l1 l5 l15 _ < /proc/loadavg
+  rec host.load1 "$l1"; rec host.load5 "$l5"; rec host.load15 "$l15"
+  if [ -r /proc/sys/net/netfilter/nf_conntrack_count ]; then
+    n=$(cat /proc/sys/net/netfilter/nf_conntrack_count); rec host.conntrack_count "$n"
+    rec host.conntrack_max "$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+    (( n * 10 >= $(cat /proc/sys/net/netfilter/nf_conntrack_max) * 9 )) \
+      && hint "the host's conntrack table is nearly full; when it fills, packets are dropped: raise net.netfilter.nf_conntrack_max"
+  fi
+  [ -r "/sys/class/net/$BRIDGE/mtu" ] && rec host.mtu_bridge "$(cat "/sys/class/net/$BRIDGE/mtu")"
+  [ -r "/sys/class/net/veth${vmid}i0/mtu" ] && rec host.mtu_veth "$(cat "/sys/class/net/veth${vmid}i0/mtu")"
+  if [ -n "$fwd" ]; then
+    n=$(iptables -w -t nat -L "$PRE" -v -n -x 2>/dev/null | awk -v p="dpt:$pub" '$0 ~ p { print $1; exit }')
+    [ -n "$n" ] && rec forward.packets "$n"
+  fi
+  if [ -r /proc/pressure/cpu ]; then
+    pressure=$(psi10 /proc/pressure/cpu); rec host.cpu_pressure10 "$pressure"
+    above "$pressure" 10 && hint "the host itself is short of CPU (${pressure}% of the last 10 s spent waiting), so everything on it lags"
+  fi
+
+  # The keystroke path: every character is a round trip client -> host ->
+  # container -> back. The NAT adds nothing measurable. The container waiting
+  # for a CPU (cores/cpulimit, or a busy host) or for memory does, and so does
+  # the uplink's queue filling behind someone's upload. Read from the cgroup
+  # files Proxmox keeps per container, without entering it.
   cg="/sys/fs/cgroup/lxc/$vmid"
-  echo "keystroke path (each character is a round trip client -> host -> container -> back):"
   rtt=$(ping -c 3 -i 0.2 -W 1 -q "$ip" 2>/dev/null | awk -F'[/ ]' '/^rtt/ { print $8 }')
   if [ -n "$rtt" ]; then
-    printf '  host -> container ping: %s ms avg%s\n' "$rtt" \
-      "$(awk -v r="$rtt" 'BEGIN { if (r > 2) printf "  <- within one host this should be well under 1 ms: the container is slow to get a CPU" }')"
+    rec keystroke.ping_ms "$rtt"
+    above "$rtt" 2 && hint "ping from the host to the container takes ${rtt} ms; within one host that should be well under 1 ms, so the container is slow to get a CPU"
   else
-    echo "  host -> container ping: no reply"
+    hint "the container does not answer ping from the host"
   fi
-  v=$(awk '/^\[/ { exit } /^(cores|cpulimit|cpuunits|memory|swap):/ { printf "%s ", $0 }' "$LXC_DIR/$vmid.conf")
-  echo "  limits: ${v:-none set (host defaults)}"
+  lim=$(awk '/^\[/ { exit } /^(cores|cpulimit|cpuunits|memory|swap):/ { printf "%s ", $0 }' "$LXC_DIR/$vmid.conf")
+  rec keystroke.limits "${lim% }"
   if [ -r "$cg/cpu.pressure" ]; then
-    echo "  cpu pressure (time spent waiting for a CPU, last 10 s / 60 s): $(awk '/^some/ { sub(/avg10=/, "", $2); sub(/avg60=/, "", $3); printf "%s%% / %s%%", $2, $3; if ($2 + 0 > 10) printf "  <- starved: raise cores or cpulimit, or the host is overloaded" }' "$cg/cpu.pressure")"
-    [ -r "$cg/cpu.stat" ] && echo "  cpulimit throttling: $(awk '/^nr_throttled/ { n = $2 } /^throttled_usec/ { t = $2 } END { printf "%d times, %.1f s in total", n, t / 1e6; if (n > 0) printf "  <- it keeps hitting its cpulimit" }' "$cg/cpu.stat")"
-    [ -r "$cg/memory.pressure" ] && echo "  memory pressure (last 10 s): $(awk '/^some/ { sub(/avg10=/, "", $2); printf "%s%%", $2; if ($2 + 0 > 5) printf "  <- reclaiming or swapping: raise memory, or find what fills it" }' "$cg/memory.pressure")"
+    pressure=$(psi10 "$cg/cpu.pressure"); rec keystroke.cpu_pressure10 "$pressure"; rec keystroke.cpu_pressure60 "$(psi60 "$cg/cpu.pressure")"
+    above "$pressure" 10 && hint "the container spent ${pressure}% of the last 10 s waiting for a CPU: raise its cores or cpulimit, or the host is overloaded"
   fi
-  [ -r /proc/pressure/cpu ] && echo "  host cpu pressure (last 10 s): $(awk '/^some/ { sub(/avg10=/, "", $2); printf "%s%%", $2; if ($2 + 0 > 10) printf "  <- the host itself is short of CPU, so everything on it lags" }' /proc/pressure/cpu)"
+  if [ -r "$cg/cpu.stat" ]; then
+    n=$(awk '/^nr_throttled/ { print $2 }' "$cg/cpu.stat"); n=${n:-0}; rec keystroke.throttled_count "$n"
+    rec keystroke.throttled_s "$(awk '/^throttled_usec/ { printf "%.1f", $2 / 1e6 }' "$cg/cpu.stat")"
+    (( n > 0 )) && hint "the container has been throttled $n times by its cpulimit"
+  fi
+  if [ -r "$cg/memory.pressure" ]; then
+    pressure=$(psi10 "$cg/memory.pressure"); rec keystroke.memory_pressure10 "$pressure"
+    above "$pressure" 5 && hint "the container is under memory pressure (${pressure}% of the last 10 s): it is reclaiming or swapping; raise its memory, or find what fills it"
+  fi
   up=$(ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
   # The queue that matters is on the physical port behind the bridge.
   for port in $(ls "/sys/class/net/$up/brif" 2>/dev/null || echo "$up"); do
     [ -n "$port" ] || continue
     kinds=$(tc qdisc show dev "$port" 2>/dev/null | awk '{ print $2 }' | sort -u | paste -sd, -)
-    printf '  uplink %s: qdisc %s, tx drops %s%s\n' "$port" "${kinds:-?}" "$(cat "/sys/class/net/$port/statistics/tx_dropped" 2>/dev/null || echo ?)" \
-      "$(case ",$kinds," in *,pfifo_fast,*) echo "  <- no fair queuing: one container's upload delays everyone's keystrokes; tc qdisc replace dev $port root fq_codel" ;; esac)"
+    rec uplink "$port ${kinds:-?} $(cat "/sys/class/net/$port/statistics/tx_dropped" 2>/dev/null || echo 0)"
+    case ",$kinds," in *,pfifo_fast,*) hint "uplink $port has no fair queuing (pfifo_fast): one container's upload delays everyone's keystrokes; run: tc qdisc replace dev $port root fq_codel" ;; esac
   done
-  echo "  from the client: 'ping $PUBLIC_V4' is the floor for every keystroke, and the host cannot lower it; 'mtr $PUBLIC_V4' shows where delay or loss is added on the way"
-}
 
-diagnose_ssh() {
-  local vmid=$1 ip="" fwd="" proto pub v dst owner t out what ms detail
-  is_int "$vmid" || die "usage: berth-netd --diagnose-ssh <vmid>"
-  [ -f "$LXC_DIR/$vmid.conf" ] || die "CT $vmid: no config in $LXC_DIR"
-  while read -r proto pub v dst owner; do
-    [ "$owner" = "$vmid" ] || continue
-    ip=$v; [ "$proto:$dst" = tcp:22 ] && fwd="$PUBLIC_V4:$pub"
-  done < <(collect 2>/dev/null)
-  if [ -z "$ip" ]; then
-    echo "CT $vmid: no signed forwards (see 'berth-netd --print'); its SSH port is not reachable through this host"
-    return 1
-  fi
-  echo "CT $vmid: $ip, SSH forward ${fwd:-none (no signed tcp forward to port 22)}"
-  if ! ct_running "$vmid"; then echo "CT $vmid is not running"; return 1; fi
-  echo
-  echo "host:"
-  echo "  load: $(cut -d' ' -f1-3 /proc/loadavg)"
-  if [ -r /proc/sys/net/netfilter/nf_conntrack_count ]; then
-    echo "  conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count) of $(cat /proc/sys/net/netfilter/nf_conntrack_max) entries (a full table drops packets: 'table full' in dmesg)"
-  fi
-  echo "  mtu: $BRIDGE $(cat "/sys/class/net/$BRIDGE/mtu" 2>/dev/null || echo ?), veth${vmid}i0 $(cat "/sys/class/net/veth${vmid}i0/mtu" 2>/dev/null || echo ?)"
-  if [ -n "$fwd" ]; then
-    echo "  forward hits: $(iptables -w -t nat -L "$PRE" -v -n -x 2>/dev/null | awk -v p="dpt:$pub" '$0 ~ p { print $1 " packets"; f = 1 } END { if (!f) print "rule not found" }')"
-  fi
-  echo
-  typing_latency "$vmid" "$ip"
-  echo
-  # Time to sshd's banner, straight to the container: the network path and
-  # sshd's accept, with no authentication involved.
+  # Login: time to sshd's banner, straight to the container (the network path
+  # and sshd's accept, no authentication yet), then what runs inside the
+  # container between "connected" and the prompt.
   t=$(ms_now)
   out=$(timeout 5 bash -c "exec 3<>/dev/tcp/$ip/22 && head -c 64 <&3" 2>/dev/null | head -1 | tr -d '\r')
   ms=$(( $(ms_now) - t ))
-  if [ -z "$out" ]; then
-    (( ms >= 5000 )) && out="no SSH banner within 5s (packets lost, or sshd stuck before greeting)" \
-      || out="connection refused: nothing listening on port 22 in the container"
-  fi
-  printf 'host -> %s:22  %5d ms  %s\n' "$ip" "$ms" "$out"
+  rec login.banner_ms "$ms"
+  if [ -n "$out" ]; then
+    rec login.banner "$out"
+    (( ms > 200 )) && hint "sshd took ${ms} ms to greet, before any authentication: the container is slow to schedule sshd"
+  elif (( ms >= 5000 )); then hint "no SSH banner from the container within 5 s: packets are lost, or sshd is stuck before greeting"
+  else hint "nothing is listening on port 22 in the container (connection refused)"; fi
   t=$(ms_now)
-  out=$(timeout 60 pct exec "$vmid" -- sh -c "$SSH_DIAG_SCRIPT" 2>&1)
-  printf 'pct exec round trip  %5d ms\n' "$(( $(ms_now) - t ))"
-  echo
-  echo "inside CT $vmid (what runs between connecting and the prompt):"
+  out=$(timeout 60 pct exec "$vmid" -- sh -c "$SSH_DIAG_SCRIPT" 2>&1); n=$?
+  rec login.pct_exec_ms "$(( $(ms_now) - t ))"
+  (( n == 0 )) || hint "pct exec into the container failed (exit $n), so the in-container measurements are missing"
   while read -r what ms detail; do
     [ -n "$what" ] || continue
     case "$what" in
-      sshd-settings) echo "  sshd: $detail" ;;
-      logind)   printf '  systemd-logind: %s, answered in %d ms%s\n' "$detail" "$ms" "$( (( ms > 1000 )) && echo '  <- PAM waits on this at every login')" ;;
-      ssh-unit) echo "  ssh service: $detail" ;;
-      dns)      printf '  dns lookup: %d ms, %s%s\n' "$ms" "$detail" "$( (( ms > 1000 )) && echo '  <- slow or broken resolver; login hooks that look names up wait on it')" ;;
-      motd)     printf '  login messages (update-motd.d): %d ms%s\n     %s\n' "$ms" "$( (( ms > 500 )) && echo '  <- these run at every login; disable the slow ones')" "$detail" ;;
-      *)        echo "  $what $ms $detail" ;;
+      sshd-settings)
+        if [ "$detail" = "(sshd not installed)" ]; then rec login.sshd_installed false; hint "no SSH server is installed in the container"
+        else
+          rec login.sshd_installed true
+          # shellcheck disable=SC2086
+          set -- $detail
+          while [ $# -ge 2 ]; do rec "login.sshd.$1" "$2"; shift 2; done
+          case " $detail " in *" usedns yes "*) hint "sshd has UseDNS yes: it looks up every client's reverse DNS before the password prompt" ;; esac
+          case " $detail " in *" gssapiauthentication yes "*) hint "sshd has GSSAPIAuthentication yes: clients try Kerberos first, which can stall before the password prompt" ;; esac
+        fi ;;
+      logind)   rec login.logind "$detail"; rec login.logind_ms "$ms"
+                (( ms > 1000 )) && hint "systemd-logind took ${ms} ms to answer; PAM waits on it at every login" ;;
+      ssh-unit) rec login.ssh_unit "$detail" ;;
+      dns)      rec login.dns_ms "$ms"; rec login.dns "${detail%% *}"
+                ns=${detail#* }; [ "$ns" = "$detail" ] && ns=""
+                rec login.nameservers "$(printf '%s' "$ns" | sed 's/nameserver //g')"
+                (( ms > 1000 )) && hint "a DNS lookup in the container took ${ms} ms: slow or broken resolver; login hooks that look names up wait on it" ;;
+      motd)     rec login.motd_ms "$ms"; rec login.motd "$detail"
+                (( ms > 500 )) && hint "the login messages (/etc/update-motd.d) took ${ms} ms; they run at every login, so disable the slow ones (chmod -x)" ;;
     esac
   done <<< "$out"
-  echo
-  echo "From the client, 'ssh -vvv -p ${fwd##*:} root@$PUBLIC_V4' shows the same login with timestamps between the steps."
+  return 0
 }
 
+diagnose_ssh() {
+  local vmid=$1 raw=${2:-} recs rc k v
+  is_int "$vmid" || die "usage: berth-netd --diagnose-ssh <vmid> [--raw]"
+  recs=$(diagnose_collect "$vmid"); rc=$?
+  (( rc == 0 )) || return $rc
+  if [ "$raw" = --raw ]; then printf '%s\n' "$recs"; return 0; fi
+  declare -A d=()
+  local -a hints=() uplinks=()
+  while IFS=$'\t' read -r k v; do
+    case "$k" in hint) hints+=("$v") ;; uplink) uplinks+=("$v") ;; '') ;; *) d[$k]=$v ;; esac
+  done <<< "$recs"
+  if [ "${d[container.signed]}" != true ] || [ "${d[container.running]:-}" != true ]; then
+    printf '%s\n' "${hints[@]}"; return 1
+  fi
+  echo "CT $vmid: ${d[container.ip]}, SSH forward ${d[forward.public]:-none}${d[forward.packets]:+ (${d[forward.packets]} packets so far)}"
+  echo
+  echo "host: load ${d[host.load1]} ${d[host.load5]} ${d[host.load15]}, conntrack ${d[host.conntrack_count]:-?}/${d[host.conntrack_max]:-?}, cpu pressure ${d[host.cpu_pressure10]:-?}%, mtu $BRIDGE ${d[host.mtu_bridge]:-?} / veth${vmid}i0 ${d[host.mtu_veth]:-?}"
+  echo
+  echo "keystroke path (each character is a round trip client -> host -> container -> back):"
+  echo "  host -> container ping: ${d[keystroke.ping_ms]:+${d[keystroke.ping_ms]} ms}${d[keystroke.ping_ms]:-no reply}"
+  echo "  limits: ${d[keystroke.limits]:-none set (host defaults)}"
+  echo "  cpu pressure: ${d[keystroke.cpu_pressure10]:-?}% / ${d[keystroke.cpu_pressure60]:-?}% (last 10 s / 60 s), throttled ${d[keystroke.throttled_count]:-?} times (${d[keystroke.throttled_s]:-?} s)"
+  echo "  memory pressure: ${d[keystroke.memory_pressure10]:-?}%"
+  for v in "${uplinks[@]}"; do read -r port kinds n <<< "$v"; echo "  uplink $port: qdisc $kinds, tx drops $n"; done
+  echo "  from the client: 'ping $PUBLIC_V4' is the floor for every keystroke, and the host cannot lower it"
+  echo
+  echo "login:"
+  echo "  sshd banner: ${d[login.banner_ms]} ms${d[login.banner]:+, ${d[login.banner]}}"
+  echo "  pct exec round trip: ${d[login.pct_exec_ms]:-?} ms"
+  v=""; for k in $(printf '%s\n' "${!d[@]}" | grep '^login\.sshd\.' | sort); do v+="${k#login.sshd.} ${d[$k]} "; done
+  [ "${d[login.sshd_installed]:-}" = false ] && v="not installed"
+  echo "  sshd: ${v:-?}"
+  [ -n "${d[login.logind]:-}" ] && echo "  systemd-logind: ${d[login.logind]} (${d[login.logind_ms]} ms)"
+  [ -n "${d[login.ssh_unit]:-}" ] && echo "  ssh service: ${d[login.ssh_unit]}"
+  [ -n "${d[login.dns_ms]:-}" ] && echo "  dns lookup: ${d[login.dns_ms]} ms, ${d[login.dns]}, nameservers ${d[login.nameservers]:-none}"
+  [ -n "${d[login.motd_ms]:-}" ] && echo "  login messages (update-motd.d): ${d[login.motd_ms]} ms: ${d[login.motd]}"
+  echo
+  if (( ${#hints[@]} )); then
+    echo "findings:"; printf '  - %s\n' "${hints[@]}"
+  else
+    echo "findings: nothing on the host stands out. Compare with 'ping $PUBLIC_V4' from the client; 'mtr $PUBLIC_V4' shows where delay is added on the way."
+  fi
+}
+
+# ---- the API ----------------------------------------------------------------
+#
+# Off unless API_PORT is set. Then `run` keeps berth-netd-api (Python, next to
+# this script) listening there: HTTPS with this host's own Proxmox API
+# certificate, so berth pins the same fingerprint it already pins, and every
+# request signed with NETD_KEY, the key berth already holds. It serves the
+# status and the diagnosis above as JSON. See the README for the endpoints.
+API_PORT="${API_PORT:-}"
+API_BIND="${API_BIND:-}"
+API_TLS="${API_TLS:-1}"
+API_PID=""
+API_STARTED=0
+
+api_cert() {  # prints "<cert> <key>", or nothing
+  local d=/etc/pve/local
+  if [ -n "${API_TLS_CERT:-}" ] && [ -n "${API_TLS_KEY:-}" ]; then echo "$API_TLS_CERT $API_TLS_KEY"
+  elif [ -r $d/pveproxy-ssl.pem ] && [ -r $d/pveproxy-ssl.key ]; then echo "$d/pveproxy-ssl.pem $d/pveproxy-ssl.key"
+  elif [ -r $d/pve-ssl.pem ] && [ -r $d/pve-ssl.key ]; then echo "$d/pve-ssl.pem $d/pve-ssl.key"
+  fi
+}
+
+# Starts the API server: in the background for the service loop, or in the
+# foreground (`berth-netd --api`). Prints why not and turns the API off when
+# something it needs is missing, so the NAT loop runs regardless.
+api_start() {
+  local mode=${1:-background} cert="" key="" api="${BERTH_NETD_API:-$(dirname "$0")/berth-netd-api}"
+  [ -n "$API_PORT" ] && [ "$API_PORT" != 0 ] || return 0
+  command -v python3 >/dev/null 2>&1 || { log "API_PORT is set but python3 is not installed; the API is off"; API_PORT=0; return 1; }
+  [ -f "$api" ] || { log "API_PORT is set but $api is missing; the API is off"; API_PORT=0; return 1; }
+  if [ "$API_TLS" != 0 ]; then
+    read -r cert key < <(api_cert)
+    if [ -z "$cert" ]; then
+      log "API_PORT is set but no certificate and key were found under /etc/pve/local; the API is off (API_TLS=0 serves plain HTTP, for tests only)"
+      API_PORT=0; return 1
+    fi
+  fi
+  API_STARTED=$(date +%s)
+  if [ "$mode" = foreground ]; then
+    NETD_KEY="$NETD_KEY" API_BIND="${API_BIND:-$PUBLIC_V4}" API_PORT="$API_PORT" API_TLS="$API_TLS" \
+      API_TLS_CERT="$cert" API_TLS_KEY="$key" BERTH_NETD="$0" exec python3 "$api"
+  fi
+  NETD_KEY="$NETD_KEY" API_BIND="${API_BIND:-$PUBLIC_V4}" API_PORT="$API_PORT" API_TLS="$API_TLS" \
+    API_TLS_CERT="$cert" API_TLS_KEY="$key" BERTH_NETD="$0" python3 "$api" &
+  API_PID=$!
+}
+api_alive() { [ -n "$API_PID" ] && kill -0 "$API_PID" 2>/dev/null; }
+api_stop() { api_alive && kill "$API_PID" 2>/dev/null; }
+
 status() {
+  if [ "${1:-}" = --raw ]; then status_collect; return; fi
   echo "gateway:"; ip -4 -o addr show dev "$BRIDGE" | grep -w "$V4_GATEWAY" || echo "  (missing)"
   echo "ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)  ipv6 forwarding: $(cat /proc/sys/net/ipv6/conf/all/forwarding)"
   echo; iptables -w -t nat -S "$POST" 2>/dev/null || echo "$POST: missing"
   echo; iptables -w -t nat -S "$PRE" 2>/dev/null || echo "$PRE: missing"
 }
 
+# The same as records (see rec above), for the API's /v1/status.
+status_collect() {
+  local line
+  rec version 1
+  rec config.bridge "$BRIDGE"; rec config.public_v4 "$PUBLIC_V4"; rec config.v4_cidr "$V4_CIDR"; rec config.v4_gateway "$V4_GATEWAY"
+  rec config.port_min "$PORT_MIN"; rec config.port_max "$PORT_MAX"; rec config.vmid_min "$VMID_MIN"; rec config.vmid_max "$VMID_MAX"
+  rec config.interval "$INTERVAL"; rec config.ssh_password_login "$([ "$SSH_PASSWORD_LOGIN" = 1 ] && echo true || echo false)"
+  rec gateway.address "$V4_GATEWAY/${V4_CIDR#*/}"
+  rec gateway.present "$(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | grep -qw "$V4_GATEWAY/${V4_CIDR#*/}" && echo true || echo false)"
+  rec ip_forward "$([ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = 1 ] && echo true || echo false)"
+  rec ipv6_forward "$([ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" = 1 ] && echo true || echo false)"
+  rec chains.prerouting "$(iptables -w -t nat -S "$PRE" >/dev/null 2>&1 && echo true || echo false)"
+  rec chains.postrouting "$(iptables -w -t nat -S "$POST" >/dev/null 2>&1 && echo true || echo false)"
+  while read -r line; do [ -n "$line" ] && rec forward "$line"; done < <(collect 2>/dev/null)
+}
+
 run() {
   local last="" last_at=0 payload now n warn last_warn="" warnfile
   warnfile=$(mktemp)
   log "watching $LXC_DIR (CT $VMID_MIN-$VMID_MAX, ports $PORT_MIN-$PORT_MAX, $V4_CIDR via $V4_GATEWAY on $BRIDGE, public $PUBLIC_V4)"
-  trap 'rm -f "$warnfile"; log "stopping; rules stay in place"; exit 0' TERM INT
+  trap 'rm -f "$warnfile"; api_stop; log "stopping; rules stay in place"; exit 0' TERM INT
+  api_start
   while true; do
     ensure_base
+    # The API server is restarted if it dies, at most twice a minute.
+    if [ -n "$API_PORT" ] && [ "$API_PORT" != 0 ] && ! api_alive && (( $(date +%s) - API_STARTED >= 30 )); then
+      log "the API server is not running; starting it"; api_start
+    fi
     payload=$(render 2>"$warnfile")
     # Skipped-forward warnings repeat every pass; log them only when they change.
     warn=$(cat "$warnfile")
@@ -577,11 +740,12 @@ case "${1:-run}" in
   --once)    check_config || exit 1; ensure_base; p=$(render); apply "$p" && log "applied $(count_forwards "$p") forward(s)" ;;
   --print)   check_config || exit 1; render ;;
   --configure-ssh) check_config || exit 1; configure_ssh "$(render 2>/dev/null)" ;;
-  --diagnose-ssh) check_config || exit 1; diagnose_ssh "${2:-}" ;;
+  --diagnose-ssh) check_config || exit 1; diagnose_ssh "${2:-}" "${3:-}" ;;
+  --api)     check_config || exit 1; [ -n "$API_PORT" ] && [ "$API_PORT" != 0 ] || die "set API_PORT in $CONF first"; api_start foreground ;;
   --ssh-script) printf '%s\n' "$SSH_SCRIPT" ;;
   --check)   check_config && echo "config ok: $CONF" ;;
   --fingerprint) fingerprint ;;
-  --status)  status ;;
+  --status)  status "${2:-}" ;;
   --remove)  remove ;;
   -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0" ;;
   *)         die "unknown command '$1' (try --help)" ;;

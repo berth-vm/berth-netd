@@ -185,10 +185,94 @@ pass_ssh "$work/nossh" "$work/roots2" RUNNING="3000" >/dev/null
 diag=$(RUNNING="3000" PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" PCT_CALLS="$work/calls.log" FAKE_ROOTS="$work/roots6" \
   BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 3000 2>&1)
 grep -q 'CT 3000: 10.60.0.2, SSH forward 203.0.113.10:20000' <<< "$diag" && grep -q 'pct exec round trip' <<< "$diag" && grep -q 'keystroke path' <<< "$diag" \
-  && grep -q 'inside CT 3000' <<< "$diag" \
+  && grep -q '^login:' <<< "$diag" && grep -q '^findings:' <<< "$diag" \
   && ok 'diagnose-ssh: reports the forward and times the hops' || bad "diagnose-ssh: reports the forward and times the hops (got '$diag')"
+raw=$(RUNNING="3000" PATH="$work/bin:$PATH" PCT_CALLS="$work/calls.log" FAKE_ROOTS="$work/roots6" \
+  BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 3000 --raw 2>&1)
+grep -qP '^container\.ip\t10\.60\.0\.2$' <<< "$raw" && grep -qP '^forward\.public\t203\.0\.113\.10:20000$' <<< "$raw" \
+  && grep -qP '^login\.pct_exec_ms\t[0-9]+$' <<< "$raw" && grep -qP '^hint\t' <<< "$raw" \
+  && ok 'diagnose-ssh --raw: one key/value record per line' || bad "diagnose-ssh --raw: one key/value record per line (got '$raw')"
+RUNNING="3000" PATH="$work/bin:$PATH" BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 9999 >/dev/null 2>&1
+[ $? = 2 ] && ok 'diagnose-ssh: a container that does not exist exits 2' || bad 'diagnose-ssh: a container that does not exist exits 2'
+st=$(BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --status --raw 2>/dev/null)
+grep -qP '^gateway\.address\t10\.60\.0\.1/22$' <<< "$st" && [ "$(grep -c $'^forward\t' <<< "$st")" = 5 ] \
+  && ok 'status --raw: records with one line per forward' || bad "status --raw: records with one line per forward (got '$st')"
 diag=$(RUNNING="3000" PATH="$work/bin:$PATH" PCT_CALLS="$work/calls.log" BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 3003 2>&1)
-grep -q 'CT 3003: no signed forwards' <<< "$diag" && ok 'diagnose-ssh: an unsigned container is named as such' || bad "diagnose-ssh: an unsigned container is named as such (got '$diag')"
+grep -q 'CT 3003 has no signed forwards' <<< "$diag" && ok 'diagnose-ssh: an unsigned container is named as such' || bad "diagnose-ssh: an unsigned container is named as such (got '$diag')"
+
+# ---- the API ---------------------------------------------------------------------
+
+printf 'PUBLIC_V4=203.0.113.10\nNETD_KEY=%s\nAPI_PORT=20005\n' "$KEY" > "$work/apibad"
+BERTH_NETD_CONF="$work/apibad" BERTH_LXC_DIR="$work/lxc" bash "$agent" --check >/dev/null 2>&1 && bad 'api: a port inside the forward range is refused' || ok 'api: a port inside the forward range is refused'
+
+if command -v python3 >/dev/null 2>&1; then
+  port=$((30000 + RANDOM % 20000)); tlsport=$((port + 1))
+  printf 'PUBLIC_V4=203.0.113.10\nNETD_KEY=%s\nAPI_PORT=%s\nAPI_BIND=127.0.0.1\nAPI_TLS=0\n' "$KEY" "$port" > "$work/apiconf"
+  RUNNING="3000" PATH="$work/bin:$PATH" PCT_CALLS="$work/calls.log" FAKE_ROOTS="$work/roots7" \
+    BERTH_NETD_CONF="$work/apiconf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --api 2>"$work/api.log" &
+  api_pid=$!
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/tls.key" -out "$work/tls.pem" -subj /CN=test -days 1 >/dev/null 2>&1
+  printf 'PUBLIC_V4=203.0.113.10\nNETD_KEY=%s\nAPI_PORT=%s\nAPI_BIND=127.0.0.1\n' "$KEY" "$tlsport" > "$work/tlsconf"
+  API_TLS_CERT="$work/tls.pem" API_TLS_KEY="$work/tls.key" BERTH_NETD_CONF="$work/tlsconf" BERTH_LXC_DIR="$work/lxc" \
+    bash "$agent" --api 2>"$work/tls.log" &
+  tls_pid=$!
+  trap 'kill $api_pid $tls_pid 2>/dev/null; rm -rf "$work"' EXIT
+  for _ in $(seq 100); do grep -q listening "$work/api.log" && grep -q listening "$work/tls.log" && break; sleep 0.1; done
+
+  # A client that signs requests the way berth does. Prints "<status> <body>".
+  call() { # path [seconds the timestamp is off] [none|wrong: the Authorization header]
+    python3 - "$KEY" "http://127.0.0.1:$port" "$1" "${2:-0}" "${3:-}" <<'PY'
+import hashlib, hmac, sys, time, urllib.request, urllib.error
+key, base, path, off, auth = sys.argv[1:6]
+ts = int(time.time()) + int(off)
+sig = hmac.new(bytes.fromhex(key), f"berth-netd api v1\n{ts}\nGET\n{path}".encode(), hashlib.sha256).hexdigest()
+if auth == "wrong": sig = "0" * 64
+headers = {} if auth == "none" else {"Authorization": f"berth-netd-v1 {ts}:{sig}"}
+try:
+    with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=90) as r: print(r.status, r.read().decode())
+except urllib.error.HTTPError as e: print(e.code, e.read().decode())
+PY
+  }
+  r=$(call /v1/health 0 none);  [[ $r == 401* ]] && ok 'api: no signature is refused' || bad "api: no signature is refused (got '$r')"
+  r=$(call /v1/health 0 wrong); [[ $r == 401* ]] && ok 'api: a wrong signature is refused' || bad "api: a wrong signature is refused (got '$r')"
+  r=$(call /v1/health 120);     [[ $r == 401* ]] && ok 'api: a stale timestamp is refused' || bad "api: a stale timestamp is refused (got '$r')"
+  r=$(call /v1/health);         [[ $r == 200* && $r == *'"ok": true'* ]] && ok 'api: a signed request is answered' || bad "api: a signed request is answered (got '$r')"
+  r=$(call /v1/nope);           [[ $r == 404* ]] && ok 'api: an unknown path is 404' || bad "api: an unknown path is 404 (got '$r')"
+  r=$(call /v1/status)
+  [[ $r == 200* ]] && [ "$(grep -o '"vmid": [0-9]*' <<< "$r" | wc -l)" = 5 ] && [[ $r == *'"public_port": 20000, "ip": "10.60.0.2", "port": 22, "vmid": 3000'* ]] \
+    && [[ $r == *'"gateway": {"address": "10.60.0.1/22"'* ]] \
+    && ok 'api: /v1/status lists the forwards as JSON' || bad "api: /v1/status lists the forwards as JSON (got '$r')"
+  r=$(call /v1/containers/3000/ssh-diagnosis)
+  [[ $r == 200* && $r == *'"container": {"vmid": 3000, "signed": true, "ip": "10.60.0.2", "running": true}'* && $r == *'"hints": ['* && $r == *'"pct_exec_ms": '* ]] \
+    && ok 'api: the diagnosis comes back as JSON' || bad "api: the diagnosis comes back as JSON (got '$r')"
+  r=$(call /v1/containers/3003/ssh-diagnosis)
+  [[ $r == 200* && $r == *'"signed": false'* ]] && ok 'api: an unsigned container says so' || bad "api: an unsigned container says so (got '$r')"
+  r=$(call /v1/containers/9999/ssh-diagnosis)
+  [[ $r == 404* ]] && ok 'api: a container that does not exist is 404' || bad "api: a container that does not exist is 404 (got '$r')"
+
+  # HTTPS, pinned by fingerprint the way berth pins the Proxmox API.
+  fp=$(openssl x509 -noout -fingerprint -sha256 -in "$work/tls.pem" | sed 's/^.*=//')
+  r=$(python3 - "$KEY" "$tlsport" "$fp" 2>&1 <<'PY'
+import hashlib, hmac, socket, ssl, sys, time
+key, port, want = sys.argv[1:4]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+with ctx.wrap_socket(socket.create_connection(("127.0.0.1", int(port)), timeout=10)) as s:
+    got = ":".join(f"{b:02X}" for b in hashlib.sha256(s.getpeercert(binary_form=True)).digest())
+    if got != want: print("fingerprint", got); sys.exit(0)
+    ts = int(time.time())
+    sig = hmac.new(bytes.fromhex(key), f"berth-netd api v1\n{ts}\nGET\n/v1/health".encode(), hashlib.sha256).hexdigest()
+    s.sendall(f"GET /v1/health HTTP/1.1\r\nHost: x\r\nAuthorization: berth-netd-v1 {ts}:{sig}\r\nConnection: close\r\n\r\n".encode())
+    data = b""
+    while chunk := s.recv(4096): data += chunk
+    print(data.decode().split("\r\n\r\n", 1)[1])
+PY
+)
+  [[ $r == *'"ok": true'* ]] && ok 'api: HTTPS with the given certificate, pinned by fingerprint' || bad "api: HTTPS with the given certificate, pinned by fingerprint (got '$r')"
+  grep -q "certificate $fp" "$work/tls.log" && ok 'api: logs the fingerprint berth must pin' || bad 'api: logs the fingerprint berth must pin'
+  kill $api_pid $tls_pid 2>/dev/null; wait $api_pid $tls_pid 2>/dev/null
+else
+  echo "skip api tests: no python3"
+fi
 
 echo
 echo "$pass passed, $fail failed"
