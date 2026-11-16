@@ -117,33 +117,78 @@ R=$root sh -c "$script" >/dev/null
 r3=$(R="$work/root-c" sh -c "$script")
 [ "$r3" = no-sshd ] && ok 'ssh: a container without sshd is left alone' || bad "ssh: a container without sshd is left alone (got '$r3')"
 
-# The agent's pass, with a stand-in pct that records what it was asked to do.
+grep -qx 'UseDNS no' "$work/root-b/etc/ssh/sshd_config.d/00-berth.conf" \
+  && grep -qx 'GSSAPIAuthentication no' "$work/root-b/etc/ssh/sshd_config.d/00-berth.conf" \
+  && ok 'ssh: drop-in turns off the two classic login delays' || bad 'ssh: drop-in turns off the two classic login delays'
+
+# The agent's pass, with stand-ins for pct and lxc-ls that record what they
+# were asked. RUNNING lists the running vmids; every call of either is counted.
 mkdir -p "$work/bin" "$work/roots"
 cat > "$work/bin/pct" <<'PCT'
 #!/bin/sh
+echo "pct $1" >> "$PCT_CALLS"
 case "$1" in
-  status) echo "status: running" ;;
+  list) echo "VMID       Status     Lock         Name"; for v in $RUNNING; do echo "$v         running                 ct$v"; done ;;
+  status) for v in $RUNNING; do [ "$v" = "$2" ] && { echo "status: running"; exit 0; }; done; echo "status: stopped" ;;
   exec)
     vmid=$2; shift 3
     [ "$1" = sh ] && [ "$2" = -c ] || exit 9
     echo "$vmid" >> "$PCT_LOG"
+    [ -n "${HANG:-}" ] && [ "$vmid" = "$HANG" ] && sleep 5
     mkdir -p "$FAKE_ROOTS/$vmid/etc/ssh"
     [ -f "$FAKE_ROOTS/$vmid/etc/ssh/sshd_config" ] || printf 'PermitRootLogin prohibit-password\n' > "$FAKE_ROOTS/$vmid/etc/ssh/sshd_config"
     R="$FAKE_ROOTS/$vmid" sh -c "$3" ;;
 esac
 PCT
-chmod +x "$work/bin/pct"
-ssh_log=$(PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" FAKE_ROOTS="$work/roots" \
-  BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --configure-ssh 2>&1)
+cat > "$work/bin/lxc-ls" <<'LS'
+#!/bin/sh
+echo "lxc-ls $1" >> "$PCT_CALLS"
+for v in $RUNNING; do echo "$v"; done
+LS
+chmod +x "$work/bin/pct" "$work/bin/lxc-ls"
+pass_ssh() { # conf roots [extra env...]
+  local conf=$1 roots=$2; shift 2
+  env "$@" PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" PCT_CALLS="$work/calls.log" FAKE_ROOTS="$roots" \
+    BERTH_NETD_CONF="$conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --configure-ssh 2>&1
+}
+: > "$work/pct.log"; : > "$work/calls.log"
+ssh_log=$(pass_ssh "$work/conf" "$work/roots" RUNNING="3000 3001 3002 3003 3004 3005 3006 3007 3008 3009")
 touched=$(sort -n "$work/pct.log" | paste -sd' ' -)
 [ "$touched" = "3000 3006 3008 3009" ] && ok 'ssh: only containers with signed forwards are touched' \
   || bad "ssh: only containers with signed forwards are touched (got '$touched')"
 grep -q 'CT 3000: allowed root password login over SSH' <<< "$ssh_log" && ok 'ssh: the change is logged' || bad 'ssh: the change is logged'
+[ "$(grep -c . "$work/calls.log")" = 5 ] && ! grep -q 'pct status' "$work/calls.log" \
+  && ok 'ssh: one process asks which containers run, not one pct status each' \
+  || bad "ssh: one process asks which containers run, not one pct status each (got $(sort "$work/calls.log" | uniq -c | tr -s ' \n' ' '))"
+: > "$work/pct.log"
+pass_ssh "$work/conf" "$work/roots3" RUNNING="3006" >/dev/null
+[ "$(cat "$work/pct.log")" = 3006 ] && ok 'ssh: stopped containers are left for a later pass' || bad "ssh: stopped containers are left for a later pass (got '$(paste -sd' ' "$work/pct.log")')"
+: > "$work/pct.log"
+hang_log=$(pass_ssh "$work/conf" "$work/roots4" RUNNING="3000 3006" HANG=3000 SSH_EXEC_TIMEOUT=1)
+grep -q 'CT 3000: pct exec did not finish within 1s; retrying in 1 min' <<< "$hang_log" && grep -q 'CT 3006: allowed' <<< "$hang_log" \
+  && ok 'ssh: a container that hangs pct exec is timed out and the others still get done' \
+  || bad "ssh: a container that hangs pct exec is timed out and the others still get done (got '$hang_log')"
+# Without lxc-ls (CI runners have none), pct list is the one-process fallback.
+if ! command -v lxc-ls >/dev/null 2>&1; then
+  mv "$work/bin/lxc-ls" "$work/lxc-ls.off"; : > "$work/calls.log"; : > "$work/pct.log"
+  pass_ssh "$work/conf" "$work/roots5" RUNNING="3008" >/dev/null
+  [ "$(cat "$work/pct.log")" = 3008 ] && [ "$(grep -c 'pct list' "$work/calls.log")" = 1 ] && ! grep -q 'pct status' "$work/calls.log" \
+    && ok 'ssh: without lxc-ls, one pct list stands in' || bad "ssh: without lxc-ls, one pct list stands in (got $(sort "$work/calls.log" | uniq -c | tr -s ' \n' ' '))"
+  mv "$work/lxc-ls.off" "$work/bin/lxc-ls"
+fi
 printf 'PUBLIC_V4=203.0.113.10\nNETD_KEY=%s\nSSH_PASSWORD_LOGIN=0\n' "$KEY" > "$work/nossh"
 : > "$work/pct.log"
-PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" FAKE_ROOTS="$work/roots2" \
-  BERTH_NETD_CONF="$work/nossh" BERTH_LXC_DIR="$work/lxc" bash "$agent" --configure-ssh >/dev/null 2>&1
+pass_ssh "$work/nossh" "$work/roots2" RUNNING="3000" >/dev/null
 [ ! -s "$work/pct.log" ] && ok 'ssh: SSH_PASSWORD_LOGIN=0 leaves containers alone' || bad 'ssh: SSH_PASSWORD_LOGIN=0 leaves containers alone'
+
+# --diagnose-ssh runs its in-container probe through pct exec and reports.
+diag=$(RUNNING="3000" PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" PCT_CALLS="$work/calls.log" FAKE_ROOTS="$work/roots6" \
+  BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 3000 2>&1)
+grep -q 'CT 3000: 10.60.0.2, SSH forward 203.0.113.10:20000' <<< "$diag" && grep -q 'pct exec round trip' <<< "$diag" \
+  && grep -q 'inside CT 3000' <<< "$diag" \
+  && ok 'diagnose-ssh: reports the forward and times the hops' || bad "diagnose-ssh: reports the forward and times the hops (got '$diag')"
+diag=$(RUNNING="3000" PATH="$work/bin:$PATH" PCT_CALLS="$work/calls.log" BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 3003 2>&1)
+grep -q 'CT 3003: no signed forwards' <<< "$diag" && ok 'diagnose-ssh: an unsigned container is named as such' || bad "diagnose-ssh: an unsigned container is named as such (got '$diag')"
 
 echo
 echo "$pass passed, $fail failed"

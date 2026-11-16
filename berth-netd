@@ -37,6 +37,8 @@
 #   berth-netd --check   validate /etc/berth-netd.conf
 #   berth-netd --configure-ssh  allow root password SSH in new containers now
 #                        (the service does this by itself within seconds)
+#   berth-netd --diagnose-ssh <vmid>  time each hop of an SSH login to one
+#                        container, to see where a slow login spends its time
 #   berth-netd --fingerprint  this host's API certificate, to compare with
 #                        berth's PROXMOX_TLS_FINGERPRINT
 #   berth-netd --remove  remove its chains and gateway address
@@ -323,6 +325,11 @@ cat > "$dropin" <<'EOF'
 PermitRootLogin yes
 PasswordAuthentication yes
 KbdInteractiveAuthentication yes
+# Two common causes of a login that hangs for seconds before the password
+# prompt: a reverse DNS lookup of the client, and a GSSAPI/Kerberos attempt
+# (RHEL-family templates ship with GSSAPIAuthentication yes). Both are off.
+UseDNS no
+GSSAPIAuthentication no
 EOF
 # Never leave a configuration sshd refuses: that would lock everyone out.
 if [ -z "$R" ] && command -v sshd >/dev/null 2>&1 && ! sshd -t >/dev/null 2>&1; then
@@ -336,32 +343,157 @@ echo changed
 SCRIPT
 
 SSH_PASSWORD_LOGIN="${SSH_PASSWORD_LOGIN:-1}"
-declare -A SSH_DONE=() SSH_RETRY_AT=()
+# The in-container step takes well under a second; a container whose init is
+# wedged must not hold the NAT loop, and everyone else's forwards, hostage.
+SSH_EXEC_TIMEOUT="${SSH_EXEC_TIMEOUT:-20}"
+declare -A SSH_DONE=() SSH_RETRY_AT=() SSH_FAILS=()
 
 # A container's identity across reinstalls: its MAC changes when it is recreated.
 ct_identity() { awk '/^\[/ { exit } /^net0:/ { if (match($0, /hwaddr=[0-9A-Fa-f:]+/)) print substr($0, RSTART + 7, RLENGTH - 7); exit }' "$1"; }
-ct_running() { pct status "$1" 2>/dev/null | grep -q 'status: running'; }
+
+# The vmids of the running containers, one line each, from a single cheap
+# process. `pct status` loads the PVE Perl stack and costs about half a second
+# per call; asked once per container per pass, with the loop blocked
+# meanwhile, that alone could stretch a 5-second pass into a 30-second one on
+# a host with a few dozen stopped containers. lxc-ls answers for all of them
+# in milliseconds; `pct list` is the one-process fallback.
+running_cts() {
+  if command -v lxc-ls >/dev/null 2>&1; then lxc-ls --running -1 2>/dev/null
+  else pct list 2>/dev/null | awk 'NR > 1 && $2 == "running" { print $1 }'
+  fi
+}
+ct_running() { running_cts | grep -qx "$1"; }
 
 # One pass over the containers whose forwards are signed (their vmids are in
 # the rule comments of the payload just applied).
 configure_ssh() {
-  local payload=$1 vmid id out rc now
+  local payload=$1 vmid id out rc now entry fails delay
+  local -a pending=()
+  declare -A up=()
   [ "$SSH_PASSWORD_LOGIN" = 1 ] || return 0
   now=$(date +%s)
   for vmid in $(grep -o 'berth CT [0-9]*' <<< "$payload" | awk '{ print $3 }' | sort -un); do
     id=$(ct_identity "$LXC_DIR/$vmid.conf"); id=${id:-unknown}
     [ "${SSH_DONE[$vmid]:-}" = "$id" ] && continue
     (( now >= ${SSH_RETRY_AT[$vmid]:-0} )) || continue
-    if ! ct_running "$vmid"; then SSH_RETRY_AT[$vmid]=$((now + 15)); continue; fi
-    out=$(pct exec "$vmid" -- sh -c "$SSH_SCRIPT" 2>&1); rc=$?
+    pending+=("$vmid:$id")
+  done
+  (( ${#pending[@]} )) || return 0
+  while read -r vmid; do [ -n "$vmid" ] && up[$vmid]=1; done < <(running_cts)
+  for entry in "${pending[@]}"; do
+    vmid=${entry%%:*}; id=${entry#*:}
+    # A stopped container costs nothing to look at again next pass, so a new
+    # one is configured on the first pass after it starts.
+    [ -n "${up[$vmid]:-}" ] || continue
+    out=$(timeout "$SSH_EXEC_TIMEOUT" pct exec "$vmid" -- sh -c "$SSH_SCRIPT" 2>&1); rc=$?
     case "$rc:$out" in
       0:*changed)  log "CT $vmid: allowed root password login over SSH"; SSH_DONE[$vmid]=$id ;;
       0:*already)  SSH_DONE[$vmid]=$id ;;
       0:*no-sshd)  log "CT $vmid: no SSH server installed; nothing to configure"; SSH_DONE[$vmid]=$id ;;
       4:*)         log "CT $vmid: sshd rejected the change, so it was rolled back; will not retry"; SSH_DONE[$vmid]=$id ;;
-      *)           log "CT $vmid: could not configure SSH yet (exit $rc); retrying in a minute"; SSH_RETRY_AT[$vmid]=$((now + 60)) ;;
+      *)
+        # 1, 2, 4, 8 minutes, then every 15: a container that never answers
+        # is looked at less and less often.
+        fails=$(( ${SSH_FAILS[$vmid]:-0} + 1 )); SSH_FAILS[$vmid]=$fails
+        delay=$(( 60 << (fails - 1) )); (( delay > 900 )) && delay=900
+        if (( rc == 124 )); then
+          log "CT $vmid: pct exec did not finish within ${SSH_EXEC_TIMEOUT}s; retrying in $((delay / 60)) min"
+        else
+          log "CT $vmid: could not configure SSH yet (exit $rc); retrying in $((delay / 60)) min"
+        fi
+        SSH_RETRY_AT[$vmid]=$((now + delay)) ;;
     esac
   done
+}
+
+# ---- where does a slow SSH login spend its time? ----------------------------
+#
+# Times each hop between a client and sshd in one container, from the host:
+# the forward, the TCP path to the container, and then, inside it, the things
+# that run between "connected" and a shell prompt (sshd's settings, PAM's
+# session setup, DNS, the login messages). Prints what it finds; changes
+# nothing in the container.
+
+# Runs INSIDE the container. Each line is "<what> <milliseconds> <detail>".
+read -r -d '' SSH_DIAG_SCRIPT <<'SCRIPT'
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+now() { read -r u _ < /proc/uptime; echo "${u%.*}${u#*.}0"; }
+took() { echo $(( $(now) - $1 )); }
+if command -v sshd >/dev/null 2>&1; then
+  echo "sshd-settings 0 $(sshd -T 2>/dev/null | grep -Ei '^(usedns|gssapiauthentication|usepam|permitrootlogin|passwordauthentication) ' | tr '\n' ' ')"
+else
+  echo "sshd-settings 0 (sshd not installed)"
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  t=$(now); s=$(timeout 10 systemctl is-active systemd-logind 2>/dev/null || echo unknown)
+  echo "logind $(took "$t") $s"
+  echo "ssh-unit 0 $(systemctl is-active ssh sshd 2>/dev/null | tr '\n' ' ')"
+fi
+if command -v getent >/dev/null 2>&1; then
+  t=$(now); timeout 10 getent hosts deb.debian.org >/dev/null 2>&1 && r=ok || r=failed
+  echo "dns $(took "$t") $r $(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
+fi
+if [ -d /etc/update-motd.d ] && command -v run-parts >/dev/null 2>&1; then
+  t=$(now); timeout 30 run-parts /etc/update-motd.d >/dev/null 2>&1
+  echo "motd $(took "$t") $(ls /etc/update-motd.d | tr '\n' ' ')"
+fi
+SCRIPT
+
+ms_now() { echo $(( ${EPOCHREALTIME/./} / 1000 )); }
+
+diagnose_ssh() {
+  local vmid=$1 ip="" fwd="" proto pub v dst owner t out what ms detail
+  is_int "$vmid" || die "usage: berth-netd --diagnose-ssh <vmid>"
+  [ -f "$LXC_DIR/$vmid.conf" ] || die "CT $vmid: no config in $LXC_DIR"
+  while read -r proto pub v dst owner; do
+    [ "$owner" = "$vmid" ] || continue
+    ip=$v; [ "$proto:$dst" = tcp:22 ] && fwd="$PUBLIC_V4:$pub"
+  done < <(collect 2>/dev/null)
+  if [ -z "$ip" ]; then
+    echo "CT $vmid: no signed forwards (see 'berth-netd --print'); its SSH port is not reachable through this host"
+    return 1
+  fi
+  echo "CT $vmid: $ip, SSH forward ${fwd:-none (no signed tcp forward to port 22)}"
+  if ! ct_running "$vmid"; then echo "CT $vmid is not running"; return 1; fi
+  echo
+  echo "host:"
+  echo "  load: $(cut -d' ' -f1-3 /proc/loadavg)"
+  if [ -r /proc/sys/net/netfilter/nf_conntrack_count ]; then
+    echo "  conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count) of $(cat /proc/sys/net/netfilter/nf_conntrack_max) entries (a full table drops packets: 'table full' in dmesg)"
+  fi
+  echo "  mtu: $BRIDGE $(cat "/sys/class/net/$BRIDGE/mtu" 2>/dev/null || echo ?), veth${vmid}i0 $(cat "/sys/class/net/veth${vmid}i0/mtu" 2>/dev/null || echo ?)"
+  if [ -n "$fwd" ]; then
+    echo "  forward hits: $(iptables -w -t nat -L "$PRE" -v -n -x 2>/dev/null | awk -v p="dpt:$pub" '$0 ~ p { print $1 " packets"; f = 1 } END { if (!f) print "rule not found" }')"
+  fi
+  echo
+  # Time to sshd's banner, straight to the container: the network path and
+  # sshd's accept, with no authentication involved.
+  t=$(ms_now)
+  out=$(timeout 5 bash -c "exec 3<>/dev/tcp/$ip/22 && head -c 64 <&3" 2>/dev/null | head -1 | tr -d '\r')
+  ms=$(( $(ms_now) - t ))
+  if [ -z "$out" ]; then
+    (( ms >= 5000 )) && out="no SSH banner within 5s (packets lost, or sshd stuck before greeting)" \
+      || out="connection refused: nothing listening on port 22 in the container"
+  fi
+  printf 'host -> %s:22  %5d ms  %s\n' "$ip" "$ms" "$out"
+  t=$(ms_now)
+  out=$(timeout 60 pct exec "$vmid" -- sh -c "$SSH_DIAG_SCRIPT" 2>&1)
+  printf 'pct exec round trip  %5d ms\n' "$(( $(ms_now) - t ))"
+  echo
+  echo "inside CT $vmid (what runs between connecting and the prompt):"
+  while read -r what ms detail; do
+    [ -n "$what" ] || continue
+    case "$what" in
+      sshd-settings) echo "  sshd: $detail" ;;
+      logind)   printf '  systemd-logind: %s, answered in %d ms%s\n' "$detail" "$ms" "$( (( ms > 1000 )) && echo '  <- PAM waits on this at every login')" ;;
+      ssh-unit) echo "  ssh service: $detail" ;;
+      dns)      printf '  dns lookup: %d ms, %s%s\n' "$ms" "$detail" "$( (( ms > 1000 )) && echo '  <- slow or broken resolver; login hooks that look names up wait on it')" ;;
+      motd)     printf '  login messages (update-motd.d): %d ms%s\n     %s\n' "$ms" "$( (( ms > 500 )) && echo '  <- these run at every login; disable the slow ones')" "$detail" ;;
+      *)        echo "  $what $ms $detail" ;;
+    esac
+  done <<< "$out"
+  echo
+  echo "From the client, 'ssh -vvv -p ${fwd##*:} root@$PUBLIC_V4' shows the same login with timestamps between the steps."
 }
 
 status() {
@@ -407,11 +539,12 @@ case "${1:-run}" in
   --once)    check_config || exit 1; ensure_base; p=$(render); apply "$p" && log "applied $(count_forwards "$p") forward(s)" ;;
   --print)   check_config || exit 1; render ;;
   --configure-ssh) check_config || exit 1; configure_ssh "$(render 2>/dev/null)" ;;
+  --diagnose-ssh) check_config || exit 1; diagnose_ssh "${2:-}" ;;
   --ssh-script) printf '%s\n' "$SSH_SCRIPT" ;;
   --check)   check_config && echo "config ok: $CONF" ;;
   --fingerprint) fingerprint ;;
   --status)  status ;;
   --remove)  remove ;;
-  -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0" ;;
   *)         die "unknown command '$1' (try --help)" ;;
 esac
