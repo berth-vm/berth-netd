@@ -439,7 +439,9 @@ if [ -d /etc/update-motd.d ] && command -v run-parts >/dev/null 2>&1; then
 fi
 SCRIPT
 
-ms_now() { echo $(( ${EPOCHREALTIME/./} / 1000 )); }
+# EPOCHREALTIME uses the locale's decimal separator ("1794843283,936155" under
+# de_DE), so strip either one.
+ms_now() { echo $(( ${EPOCHREALTIME//[.,]/} / 1000 )); }
 
 # Every character typed is a round trip: client -> host -> container -> back.
 # The NAT adds nothing measurable. What does is the container waiting for a
