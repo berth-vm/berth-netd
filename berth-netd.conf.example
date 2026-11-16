@@ -32,5 +32,10 @@ IPV6_FORWARD=1
 # file holds a secret, so keep it root-only (chmod 600).
 NETD_KEY=
 
+# Allow root password login over SSH in each new berth container, once, right
+# after it first runs (Debian and Ubuntu refuse it by default, which makes the
+# password on berth's Password tab useless over SSH). 0 to leave SSH alone.
+SSH_PASSWORD_LOGIN=1
+
 # Seconds between checks for new or removed forwards.
 INTERVAL=5

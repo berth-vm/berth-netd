@@ -8,9 +8,12 @@ Proxmox VE host and keeps the host's NAT in step with berth's containers:
 - outbound NAT, so containers reach the internet over IPv4
 - one DNAT rule per port forward, so `<host public IPv4>:<port>` reaches a
   container. Each container's SSH port is one of these.
+- root password login over SSH, enabled once in each new container, so the
+  password berth shows its owner actually works over SSH
 
-When a user adds a forward in berth, it is live on the host within seconds.
-Nobody has to run `iptables` by hand.
+When a user adds a forward in berth, it is live on the host within seconds,
+and a new container accepts its root password over SSH as soon as it's up.
+Nobody has to run `iptables` or edit `sshd_config` by hand.
 
 ## How it works
 
@@ -43,6 +46,30 @@ The agent only ever writes its own two chains, replaced atomically with
 `iptables-restore --noflush`, and leaves every other rule on the host alone.
 The key is read from a root-only file, and the agent passes it to its verifier
 through the environment, never on a command line where `ps` could show it.
+
+### Root password login over SSH
+
+Debian's and Ubuntu's SSH servers refuse root password logins by default, so
+the random root password berth sets, and shows on its Password tab, can't be
+used over SSH. The agent fixes that once for each container, as soon as the
+container is running:
+
+- From the host it runs `pct exec <vmid>`, which needs no network access and
+  no credentials inside the container.
+- It writes `/etc/ssh/sshd_config.d/00-berth.conf` with
+  `PermitRootLogin yes` and `PasswordAuthentication yes`. If the main config
+  lacks an `Include` line for that directory, it adds one at the top.
+- It checks the result with `sshd -t` and removes the file again if sshd
+  rejects it. Then it reloads SSH.
+- It leaves a marker at `/var/lib/berth/ssh-password-login` and never touches
+  that container's SSH configuration again, so the owner can change it freely
+  afterwards. A reinstall creates a fresh filesystem without the marker, so it
+  is configured again.
+
+It only touches containers whose forwards carry a valid berth signature, and
+the command it runs is fixed: nothing from a tag ends up in it. Set
+`SSH_PASSWORD_LOGIN=0` to turn this off. `berth-netd --ssh-script` prints
+exactly what runs inside the container.
 
 ### The wire format
 
@@ -101,6 +128,7 @@ Running it again updates the agent and keeps your configuration.
 | `VMID_MIN`, `VMID_MAX` | `PROXMOX_VMID_MIN`, `_MAX` | `3000`, `3999` |
 | `NETD_KEY` | `BERTH_NETD_KEY` | required |
 | `IPV6_FORWARD` | | `1`: containers use the host as their IPv6 gateway |
+| `SSH_PASSWORD_LOGIN` | | `1`: allow root password SSH in each new container, once |
 | `INTERVAL` | | `5` seconds between checks |
 
 After editing, run `systemctl restart berth-netd`.
@@ -113,6 +141,7 @@ berth-netd --status              # gateway, forwarding, and both chains
 berth-netd --print               # the rules it would apply now; changes nothing
 berth-netd --check               # validate the config
 berth-netd --fingerprint         # this host's API certificate fingerprint
+berth-netd --configure-ssh       # run the SSH step now rather than waiting for the loop
 berth-netd --remove              # take its chains and gateway address away
 ```
 
@@ -135,8 +164,8 @@ value here with `berth-netd --fingerprint`.
 
 ## Requirements
 
-Proxmox VE 8 (any Debian 12 based host with `iptables`, `perl` and
-`openssl`, all of which Proxmox ships). Nothing else needs installing.
+Proxmox VE 8 (any Debian 12 based host with `iptables`, `perl`, `openssl` and
+`pct`, all of which Proxmox ships). Nothing else needs installing.
 
 ## Tests
 

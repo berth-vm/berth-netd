@@ -6,6 +6,8 @@
 #   - the containers' IPv4 gateway (V4_GATEWAY on BRIDGE) and IP forwarding
 #   - outbound NAT for V4_CIDR, so containers reach the internet over IPv4
 #   - one DNAT rule per port forward, so PUBLIC_V4:<port> reaches a container
+#   - root password login over SSH in each new container, once, so the
+#     password berth shows its owner works (SSH_PASSWORD_LOGIN=0 to turn off)
 #
 # Where the forwards come from: berth writes them onto each container as
 # Proxmox tags, "berth-<tcp|udp>-<public port>-<container port>" (the SSH port
@@ -33,6 +35,8 @@
 #   berth-netd --print   print the rules it would apply; changes nothing
 #   berth-netd --status  show the current chains and gateway
 #   berth-netd --check   validate /etc/berth-netd.conf
+#   berth-netd --configure-ssh  allow root password SSH in new containers now
+#                        (the service does this by itself within seconds)
 #   berth-netd --fingerprint  this host's API certificate, to compare with
 #                        berth's PROXMOX_TLS_FINGERPRINT
 #   berth-netd --remove  remove its chains and gateway address
@@ -283,6 +287,83 @@ fingerprint() {
   openssl x509 -noout -fingerprint -sha256 -in "$f" | sed 's/^.*=//'
 }
 
+# ---- root password login over SSH -------------------------------------------
+#
+# berth sets a random root password on every container and shows it to the
+# owner, but Debian's and Ubuntu's SSH servers refuse root password logins by
+# default, so that password could not be used over SSH. Once per container,
+# right after it is first seen running, this writes a drop-in that allows it.
+#
+# Done from the host with `pct exec`, which needs no network access to the
+# container and no credentials. Only containers whose forwards carry a valid
+# berth signature are touched, and the command run is fixed: nothing from a
+# tag reaches it. A marker inside the container means it is done exactly once;
+# change or delete the drop-in afterwards and it stays that way. A reinstall
+# is a new filesystem without the marker, so it is configured again.
+
+# Runs INSIDE the container, as root. R is a root prefix for tests only.
+read -r -d '' SSH_SCRIPT <<'SCRIPT'
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+R=${R:-}
+marker="$R/var/lib/berth/ssh-password-login"
+cfg="$R/etc/ssh/sshd_config"
+dropin="$R/etc/ssh/sshd_config.d/00-berth.conf"
+[ -e "$marker" ] && { echo already; exit 0; }
+[ -f "$cfg" ] || { echo no-sshd; exit 0; }
+mkdir -p "$R/etc/ssh/sshd_config.d"
+# The first value sshd reads for a setting wins, so the drop-ins must be
+# included before the main file's own settings: at the top.
+if ! grep -Eqi '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$cfg"; then
+  sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$cfg"
+fi
+cat > "$dropin" <<'EOF'
+# Written once by berth-netd so the root password shown on berth's Password
+# tab works over SSH. Edit or delete it freely: berth-netd will not touch this
+# container's SSH configuration again.
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+EOF
+# Never leave a configuration sshd refuses: that would lock everyone out.
+if [ -z "$R" ] && command -v sshd >/dev/null 2>&1 && ! sshd -t >/dev/null 2>&1; then
+  rm -f "$dropin"; echo invalid; exit 4
+fi
+if [ -z "$R" ]; then
+  { systemctl reload ssh || systemctl reload sshd || rc-service sshd restart || service ssh reload; } >/dev/null 2>&1 || true
+fi
+mkdir -p "$R/var/lib/berth" && : > "$marker"
+echo changed
+SCRIPT
+
+SSH_PASSWORD_LOGIN="${SSH_PASSWORD_LOGIN:-1}"
+declare -A SSH_DONE=() SSH_RETRY_AT=()
+
+# A container's identity across reinstalls: its MAC changes when it is recreated.
+ct_identity() { awk '/^\[/ { exit } /^net0:/ { if (match($0, /hwaddr=[0-9A-Fa-f:]+/)) print substr($0, RSTART + 7, RLENGTH - 7); exit }' "$1"; }
+ct_running() { pct status "$1" 2>/dev/null | grep -q 'status: running'; }
+
+# One pass over the containers whose forwards are signed (their vmids are in
+# the rule comments of the payload just applied).
+configure_ssh() {
+  local payload=$1 vmid id out rc now
+  [ "$SSH_PASSWORD_LOGIN" = 1 ] || return 0
+  now=$(date +%s)
+  for vmid in $(grep -o 'berth CT [0-9]*' <<< "$payload" | awk '{ print $3 }' | sort -un); do
+    id=$(ct_identity "$LXC_DIR/$vmid.conf"); id=${id:-unknown}
+    [ "${SSH_DONE[$vmid]:-}" = "$id" ] && continue
+    (( now >= ${SSH_RETRY_AT[$vmid]:-0} )) || continue
+    if ! ct_running "$vmid"; then SSH_RETRY_AT[$vmid]=$((now + 15)); continue; fi
+    out=$(pct exec "$vmid" -- sh -c "$SSH_SCRIPT" 2>&1); rc=$?
+    case "$rc:$out" in
+      0:*changed)  log "CT $vmid: allowed root password login over SSH"; SSH_DONE[$vmid]=$id ;;
+      0:*already)  SSH_DONE[$vmid]=$id ;;
+      0:*no-sshd)  log "CT $vmid: no SSH server installed; nothing to configure"; SSH_DONE[$vmid]=$id ;;
+      4:*)         log "CT $vmid: sshd rejected the change, so it was rolled back; will not retry"; SSH_DONE[$vmid]=$id ;;
+      *)           log "CT $vmid: could not configure SSH yet (exit $rc); retrying in a minute"; SSH_RETRY_AT[$vmid]=$((now + 60)) ;;
+    esac
+  done
+}
+
 status() {
   echo "gateway:"; ip -4 -o addr show dev "$BRIDGE" | grep -w "$V4_GATEWAY" || echo "  (missing)"
   echo "ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)  ipv6 forwarding: $(cat /proc/sys/net/ipv6/conf/all/forwarding)"
@@ -316,6 +397,7 @@ run() {
         log "iptables-restore failed; will retry"
       fi
     fi
+    configure_ssh "$last"
     sleep "$INTERVAL" & wait $!
   done
 }
@@ -324,6 +406,8 @@ case "${1:-run}" in
   run)       check_config || exit 1; run ;;
   --once)    check_config || exit 1; ensure_base; p=$(render); apply "$p" && log "applied $(count_forwards "$p") forward(s)" ;;
   --print)   check_config || exit 1; render ;;
+  --configure-ssh) check_config || exit 1; configure_ssh "$(render 2>/dev/null)" ;;
+  --ssh-script) printf '%s\n' "$SSH_SCRIPT" ;;
   --check)   check_config && echo "config ok: $CONF" ;;
   --fingerprint) fingerprint ;;
   --status)  status ;;

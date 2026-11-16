@@ -93,6 +93,58 @@ BERTH_NETD_CONF="$work/lowport" BERTH_LXC_DIR="$work/lxc" bash "$agent" --check 
 printf 'PUBLIC_V4=10.60.0.5\nNETD_KEY=%s\n' "$KEY" > "$work/badpub"
 BERTH_NETD_CONF="$work/badpub" BERTH_LXC_DIR="$work/lxc" bash "$agent" --check >/dev/null 2>&1 && bad 'public address inside the container network is refused' || ok 'public address inside the container network is refused'
 
+# ---- SSH password login --------------------------------------------------------
+
+# The in-container script, against a fake root filesystem.
+script=$(bash "$agent" --ssh-script)
+root="$work/root-a"; mkdir -p "$root/etc/ssh"
+printf '#PermitRootLogin prohibit-password\nPasswordAuthentication no\n' > "$root/etc/ssh/sshd_config"
+r1=$(R=$root sh -c "$script")
+[ "$r1" = changed ] && ok 'ssh: first run configures' || bad "ssh: first run configures (got '$r1')"
+[ "$(head -1 "$root/etc/ssh/sshd_config")" = 'Include /etc/ssh/sshd_config.d/*.conf' ] \
+  && ok 'ssh: drop-ins are included before the main settings' || bad 'ssh: drop-ins are included before the main settings'
+grep -qx 'PermitRootLogin yes' "$root/etc/ssh/sshd_config.d/00-berth.conf" \
+  && grep -qx 'PasswordAuthentication yes' "$root/etc/ssh/sshd_config.d/00-berth.conf" \
+  && ok 'ssh: drop-in allows root password login' || bad 'ssh: drop-in allows root password login'
+rm "$root/etc/ssh/sshd_config.d/00-berth.conf"   # the owner changes their mind
+r2=$(R=$root sh -c "$script")
+[ "$r2" = already ] && [ ! -e "$root/etc/ssh/sshd_config.d/00-berth.conf" ] \
+  && ok 'ssh: never touched again once done' || bad "ssh: never touched again once done (got '$r2')"
+root="$work/root-b"; mkdir -p "$root/etc/ssh"
+printf 'Include /etc/ssh/sshd_config.d/*.conf\nPermitRootLogin no\n' > "$root/etc/ssh/sshd_config"
+R=$root sh -c "$script" >/dev/null
+[ "$(grep -c '^Include' "$root/etc/ssh/sshd_config")" = 1 ] && ok 'ssh: an existing Include is not duplicated' || bad 'ssh: an existing Include is not duplicated'
+r3=$(R="$work/root-c" sh -c "$script")
+[ "$r3" = no-sshd ] && ok 'ssh: a container without sshd is left alone' || bad "ssh: a container without sshd is left alone (got '$r3')"
+
+# The agent's pass, with a stand-in pct that records what it was asked to do.
+mkdir -p "$work/bin" "$work/roots"
+cat > "$work/bin/pct" <<'PCT'
+#!/bin/sh
+case "$1" in
+  status) echo "status: running" ;;
+  exec)
+    vmid=$2; shift 3
+    [ "$1" = sh ] && [ "$2" = -c ] || exit 9
+    echo "$vmid" >> "$PCT_LOG"
+    mkdir -p "$FAKE_ROOTS/$vmid/etc/ssh"
+    [ -f "$FAKE_ROOTS/$vmid/etc/ssh/sshd_config" ] || printf 'PermitRootLogin prohibit-password\n' > "$FAKE_ROOTS/$vmid/etc/ssh/sshd_config"
+    R="$FAKE_ROOTS/$vmid" sh -c "$3" ;;
+esac
+PCT
+chmod +x "$work/bin/pct"
+ssh_log=$(PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" FAKE_ROOTS="$work/roots" \
+  BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --configure-ssh 2>&1)
+touched=$(sort -n "$work/pct.log" | paste -sd' ' -)
+[ "$touched" = "3000 3006 3008 3009" ] && ok 'ssh: only containers with signed forwards are touched' \
+  || bad "ssh: only containers with signed forwards are touched (got '$touched')"
+grep -q 'CT 3000: allowed root password login over SSH' <<< "$ssh_log" && ok 'ssh: the change is logged' || bad 'ssh: the change is logged'
+printf 'PUBLIC_V4=203.0.113.10\nNETD_KEY=%s\nSSH_PASSWORD_LOGIN=0\n' "$KEY" > "$work/nossh"
+: > "$work/pct.log"
+PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" FAKE_ROOTS="$work/roots2" \
+  BERTH_NETD_CONF="$work/nossh" BERTH_LXC_DIR="$work/lxc" bash "$agent" --configure-ssh >/dev/null 2>&1
+[ ! -s "$work/pct.log" ] && ok 'ssh: SSH_PASSWORD_LOGIN=0 leaves containers alone' || bad 'ssh: SSH_PASSWORD_LOGIN=0 leaves containers alone'
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
