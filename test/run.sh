@@ -184,7 +184,7 @@ pass_ssh "$work/nossh" "$work/roots2" RUNNING="3000" >/dev/null
 # --diagnose-ssh runs its in-container probe through pct exec and reports.
 diag=$(RUNNING="3000" PATH="$work/bin:$PATH" PCT_LOG="$work/pct.log" PCT_CALLS="$work/calls.log" FAKE_ROOTS="$work/roots6" \
   BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 3000 2>&1)
-grep -q 'CT 3000: 10.60.0.2, SSH forward 203.0.113.10:20000' <<< "$diag" && grep -q 'pct exec round trip' <<< "$diag" \
+grep -q 'CT 3000: 10.60.0.2, SSH forward 203.0.113.10:20000' <<< "$diag" && grep -q 'pct exec round trip' <<< "$diag" && grep -q 'keystroke path' <<< "$diag" \
   && grep -q 'inside CT 3000' <<< "$diag" \
   && ok 'diagnose-ssh: reports the forward and times the hops' || bad "diagnose-ssh: reports the forward and times the hops (got '$diag')"
 diag=$(RUNNING="3000" PATH="$work/bin:$PATH" PCT_CALLS="$work/calls.log" BERTH_NETD_CONF="$work/conf" BERTH_LXC_DIR="$work/lxc" bash "$agent" --diagnose-ssh 3003 2>&1)

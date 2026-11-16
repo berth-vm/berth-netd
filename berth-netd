@@ -441,6 +441,42 @@ SCRIPT
 
 ms_now() { echo $(( ${EPOCHREALTIME/./} / 1000 )); }
 
+# Every character typed is a round trip: client -> host -> container -> back.
+# The NAT adds nothing measurable. What does is the container waiting for a
+# CPU (cores/cpulimit, or a busy host), memory pressure in it, the uplink's
+# queue filling behind someone's upload, or simply the distance to the
+# client. The first three can be seen from here, through the cgroup files
+# that Proxmox keeps per container, without entering it.
+typing_latency() {
+  local vmid=$1 ip=$2 rtt v up port kinds cg
+  cg="/sys/fs/cgroup/lxc/$vmid"
+  echo "keystroke path (each character is a round trip client -> host -> container -> back):"
+  rtt=$(ping -c 3 -i 0.2 -W 1 -q "$ip" 2>/dev/null | awk -F'[/ ]' '/^rtt/ { print $8 }')
+  if [ -n "$rtt" ]; then
+    printf '  host -> container ping: %s ms avg%s\n' "$rtt" \
+      "$(awk -v r="$rtt" 'BEGIN { if (r > 2) printf "  <- within one host this should be well under 1 ms: the container is slow to get a CPU" }')"
+  else
+    echo "  host -> container ping: no reply"
+  fi
+  v=$(awk '/^\[/ { exit } /^(cores|cpulimit|cpuunits|memory|swap):/ { printf "%s ", $0 }' "$LXC_DIR/$vmid.conf")
+  echo "  limits: ${v:-none set (host defaults)}"
+  if [ -r "$cg/cpu.pressure" ]; then
+    echo "  cpu pressure (time spent waiting for a CPU, last 10 s / 60 s): $(awk '/^some/ { sub(/avg10=/, "", $2); sub(/avg60=/, "", $3); printf "%s%% / %s%%", $2, $3; if ($2 + 0 > 10) printf "  <- starved: raise cores or cpulimit, or the host is overloaded" }' "$cg/cpu.pressure")"
+    [ -r "$cg/cpu.stat" ] && echo "  cpulimit throttling: $(awk '/^nr_throttled/ { n = $2 } /^throttled_usec/ { t = $2 } END { printf "%d times, %.1f s in total", n, t / 1e6; if (n > 0) printf "  <- it keeps hitting its cpulimit" }' "$cg/cpu.stat")"
+    [ -r "$cg/memory.pressure" ] && echo "  memory pressure (last 10 s): $(awk '/^some/ { sub(/avg10=/, "", $2); printf "%s%%", $2; if ($2 + 0 > 5) printf "  <- reclaiming or swapping: raise memory, or find what fills it" }' "$cg/memory.pressure")"
+  fi
+  [ -r /proc/pressure/cpu ] && echo "  host cpu pressure (last 10 s): $(awk '/^some/ { sub(/avg10=/, "", $2); printf "%s%%", $2; if ($2 + 0 > 10) printf "  <- the host itself is short of CPU, so everything on it lags" }' /proc/pressure/cpu)"
+  up=$(ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+  # The queue that matters is on the physical port behind the bridge.
+  for port in $(ls "/sys/class/net/$up/brif" 2>/dev/null || echo "$up"); do
+    [ -n "$port" ] || continue
+    kinds=$(tc qdisc show dev "$port" 2>/dev/null | awk '{ print $2 }' | sort -u | paste -sd, -)
+    printf '  uplink %s: qdisc %s, tx drops %s%s\n' "$port" "${kinds:-?}" "$(cat "/sys/class/net/$port/statistics/tx_dropped" 2>/dev/null || echo ?)" \
+      "$(case ",$kinds," in *,pfifo_fast,*) echo "  <- no fair queuing: one container's upload delays everyone's keystrokes; tc qdisc replace dev $port root fq_codel" ;; esac)"
+  done
+  echo "  from the client: 'ping $PUBLIC_V4' is the floor for every keystroke, and the host cannot lower it; 'mtr $PUBLIC_V4' shows where delay or loss is added on the way"
+}
+
 diagnose_ssh() {
   local vmid=$1 ip="" fwd="" proto pub v dst owner t out what ms detail
   is_int "$vmid" || die "usage: berth-netd --diagnose-ssh <vmid>"
@@ -465,6 +501,8 @@ diagnose_ssh() {
   if [ -n "$fwd" ]; then
     echo "  forward hits: $(iptables -w -t nat -L "$PRE" -v -n -x 2>/dev/null | awk -v p="dpt:$pub" '$0 ~ p { print $1 " packets"; f = 1 } END { if (!f) print "rule not found" }')"
   fi
+  echo
+  typing_latency "$vmid" "$ip"
   echo
   # Time to sshd's banner, straight to the container: the network path and
   # sshd's accept, with no authentication involved.

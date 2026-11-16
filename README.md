@@ -180,6 +180,11 @@ a shell prompt, and points at whichever is slow:
 | Seconds pass before the password prompt | `UseDNS` or `GSSAPIAuthentication` on in sshd | Both are off in the agent's drop-in. Containers configured before this version keep their old drop-in; add the two lines to `/etc/ssh/sshd_config.d/00-berth.conf` by hand. |
 | Password accepted, then a long wait for the prompt | `systemd-logind` not answering (PAM waits up to 25 s), or a slow resolver | `systemctl restart systemd-logind`; check `/etc/resolv.conf` |
 | Same, on Ubuntu | the login messages in `/etc/update-motd.d` (apt and ESM checks, `landscape-sysinfo`) | `chmod -x` the slow ones; they run at every login |
+| Each typed character takes a moment to appear | Every keystroke is a round trip, so this is latency on the path, not sshd. The diagnosis's "keystroke path" section measures the three causes the host can see: | |
+| … and the container's CPU pressure or throttling is high | the container is waiting for a CPU: its `cores`/`cpulimit` cap, or an overloaded host (`host cpu pressure`) | raise `cores`/`cpulimit` in berth, or move load off the host |
+| … and the container's memory pressure is high | it is reclaiming or swapping | raise its memory, or find what fills it |
+| … and the uplink runs `pfifo_fast` | no fair queuing: one container's upload fills the NIC's queue and every other packet waits behind it | `sysctl -w net.core.default_qdisc=fq_codel` and `tc qdisc replace dev <nic> root fq_codel` |
+| … and none of the above | the client is far from the host, or loses packets on the way | `ping <host>` from the client is the floor for every keystroke; `mtr <host>` shows where delay is added. Nothing on the host lowers it. |
 | Typing is fine but output stalls, `cat` of a big file hangs | path MTU: a hop between the client and the host drops ICMP, so TCP can't learn the smaller MTU | On the host: `iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu` (the agent leaves `mangle` alone, so add it to your own rules) |
 | Everything is sluggish, `dmesg` says `nf_conntrack: table full` | the host's connection-tracking table | `sysctl -w net.netfilter.nf_conntrack_max=262144`, and persist it in `/etc/sysctl.d/` |
 
